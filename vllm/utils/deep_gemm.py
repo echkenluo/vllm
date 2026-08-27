@@ -539,6 +539,20 @@ def fp8_fp4_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
+    if not is_deep_gemm_supported():
+        q_values, q_scale = q
+        if q_scale is not None:
+            raise NotImplementedError(
+                "The portable pre-Hopper sparse indexer fallback supports FP8 Q only."
+            )
+        from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+            fp8_mqa_logits_torch,
+        )
+
+        return fp8_mqa_logits_torch(
+            q_values, kv, weights, cu_seqlen_ks, cu_seqlen_ke
+        )
+
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
         return _missing()
@@ -645,6 +659,30 @@ def fp8_fp4_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
+    if not is_deep_gemm_supported():
+        q_values, q_scale = q
+        if q_scale is not None:
+            raise NotImplementedError(
+                "The portable pre-Hopper sparse indexer fallback supports FP8 Q only."
+            )
+        if indices is not None:
+            raise NotImplementedError(
+                "The portable pre-Hopper sparse indexer fallback does not support "
+                "varlen request indices."
+            )
+        from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+            fp8_paged_mqa_logits_torch,
+        )
+
+        return fp8_paged_mqa_logits_torch(
+            q_values,
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+        )
+
     _lazy_init()
     if _fp8_fp4_paged_mqa_logits_impl is None:
         return _missing()
@@ -676,6 +714,17 @@ def tf32_hc_prenorm_gemm(
 
     See the caller function for shape requirement
     """
+    if not is_deep_gemm_supported():
+        # The fused DeepGEMM hyperconnection kernel only supports Hopper and
+        # newer GPUs. Keep the split-output contract for pre-Hopper devices:
+        # consumers reduce the leading dimension, so placing the full result
+        # in split zero and clearing the remaining splits is equivalent.
+        out.zero_()
+        sqrsum.zero_()
+        torch.mm(x.float(), fn.t(), out=out[0])
+        torch.sum(x.float().square(), dim=-1, out=sqrsum[0])
+        return out
+
     _lazy_init()
     if _tf32_hc_prenorm_gemm_impl is None:
         return _missing()
