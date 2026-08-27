@@ -20,6 +20,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
     DeepseekV4FlashMLAMetadata,
 )
+from vllm.platforms import current_platform
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
@@ -40,6 +41,24 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        device_capability = current_platform.get_device_capability()
+        if device_capability is not None and device_capability.major < 9:
+            # DeepGEMM's FP8 einsum path is Hopper-or-newer. Reuse the BF16
+            # reference projection on SM89 so DSV4 remains functional there.
+            from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+                rocm_inv_rope_einsum,
+            )
+
+            z = rocm_inv_rope_einsum(
+                self.rotary_emb,
+                o,
+                positions,
+                self.rope_head_dim,
+                self.n_local_groups,
+                self.o_lora_rank,
+                self.wo_a,
+            )
+            return self.wo_b(z.flatten(1))
         return deep_gemm_fp8_o_proj(
             o,
             positions,
@@ -179,6 +198,37 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
 
         swa_indices = swa_metadata.decode_swa_indices
         swa_lens = swa_metadata.decode_swa_lens
+
+        device_capability = current_platform.get_device_capability()
+        if device_capability is not None and device_capability.major < 9:
+            # FlashMLA's sparse decode kernel is Hopper-or-newer. The Triton
+            # reference path is architecture-portable and consumes the same
+            # fp8_ds_mla cache layout, so use it to keep SM89 functional.
+            from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+                rocm_sparse_attn_decode,
+            )
+
+            rocm_sparse_attn_decode(
+                q=q,
+                kv_cache=kv_cache,
+                swa_k_cache=self.swa_cache_layer.kv_cache,
+                swa_only=swa_only,
+                topk_indices=topk_indices,
+                topk_lens=topk_lens,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                swa_ragged_indices=None,
+                swa_ragged_indptr=None,
+                topk_ragged_indices=None,
+                topk_ragged_indptr=None,
+                attn_sink=self.attn_sink,
+                scale=self.scale,
+                head_dim=self.head_dim,
+                nope_head_dim=self.nope_head_dim,
+                rope_head_dim=self.rope_head_dim,
+                output=output,
+            )
+            return
 
         # We treat queries in the same seq as different queries
         # and later we only attend by generated indices.
@@ -336,12 +386,34 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
                 chunk_M,
                 chunk_N,
             )
-            flash_mla_sparse_fwd(
-                q=q[query_start:query_end],
-                kv=kv.view(-1, 1, q.shape[-1]),
-                indices=combined_indices.unsqueeze(1),
-                sm_scale=self.scale,
-                attn_sink=self.attn_sink,
-                topk_length=combined_lens,
-                out=output[query_start:query_end],
-            )
+            device_capability = current_platform.get_device_capability()
+            if device_capability is not None and device_capability.major < 9:
+                # FlashMLA sparse prefill and its CuTeDSL gather path require
+                # Hopper.  Reuse the architecture-portable Triton prefill on
+                # SM89, matching the decode fallback above.
+                from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+                    rocm_sparse_attn_prefill,
+                )
+
+                rocm_sparse_attn_prefill(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices,
+                    topk_length=combined_lens,
+                    scale=self.scale,
+                    head_dim=self.head_dim,
+                    nope_head_dim=self.nope_head_dim,
+                    rope_head_dim=self.rope_head_dim,
+                    attn_sink=self.attn_sink,
+                    output=output[query_start:query_end],
+                )
+            else:
+                flash_mla_sparse_fwd(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices.unsqueeze(1),
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    topk_length=combined_lens,
+                    out=output[query_start:query_end],
+                )

@@ -21,7 +21,9 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
-    has_deep_gemm,
+    fp8_mqa_logits_torch,
+    fp8_paged_mqa_logits_torch,
+    is_deep_gemm_supported,
 )
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.torch_utils import (
@@ -462,7 +464,7 @@ def sparse_attn_indexer(
                         cu_seqlen_ks,
                         cu_seqlen_ke,
                     )
-                else:
+                elif is_deep_gemm_supported():
                     logits = fp8_fp4_mqa_logits(
                         (q_slice_cast, q_scale_slice),
                         (k_quant_cast, k_scale_cast),
@@ -470,6 +472,18 @@ def sparse_attn_indexer(
                         cu_seqlen_ks,
                         cu_seqlen_ke,
                         clean_logits=False,
+                    )
+                else:
+                    if use_fp4_cache:
+                        raise RuntimeError(
+                            "MXFP4 sparse indexer cache requires DeepGEMM support."
+                        )
+                    logits = fp8_mqa_logits_torch(
+                        q_slice_cast,
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
                     )
                 num_rows = logits.shape[0]
                 ops.top_k_per_row_prefill(
@@ -558,7 +572,7 @@ def sparse_attn_indexer(
                 decode_metadata.schedule_metadata,
                 max_model_len,
             )
-        else:
+        elif is_deep_gemm_supported():
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
@@ -568,6 +582,19 @@ def sparse_attn_indexer(
                 decode_metadata.schedule_metadata,
                 max_model_len=max_model_len,
                 clean_logits=False,
+            )
+        else:
+            if use_fp4_cache:
+                raise RuntimeError(
+                    "MXFP4 sparse indexer cache requires DeepGEMM support."
+                )
+            logits = fp8_paged_mqa_logits_torch(
+                padded_q_quant_cast,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_model_len=max_model_len,
             )
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
@@ -725,10 +752,15 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
-        if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
-                "the current vLLM environment."
+        if current_platform.is_cuda() and self.use_fp4_cache:
+            if not is_deep_gemm_supported():
+                raise RuntimeError(
+                    "MXFP4 sparse indexer cache requires DeepGEMM support."
+                )
+        elif current_platform.is_cuda() and not is_deep_gemm_supported():
+            logger.warning_once(
+                "DeepGEMM is unavailable on this GPU. SparseAttnIndexer will use "
+                "the slower PyTorch reference implementation."
             )
 
     def forward_native(

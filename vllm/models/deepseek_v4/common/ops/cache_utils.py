@@ -400,7 +400,11 @@ def dequantize_and_gather_k_cache(
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
-    if has_cutedsl():
+    # The CuTeDSL implementation currently emits SM90-only BF16 conversion
+    # and arithmetic instructions.  Package availability alone is therefore
+    # insufficient on Ada (for example L20 / SM89); use the Triton fallback
+    # there instead.
+    if has_cutedsl() and current_platform.has_device_capability(90):
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             dequantize_and_gather_k_cache_cutedsl,

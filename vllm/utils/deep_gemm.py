@@ -541,6 +541,124 @@ def fp8_fp4_mqa_logits(
     )
 
 
+def fp8_mqa_logits_torch(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    """Reference FP8 MQA logits implementation for CUDA without DeepGEMM."""
+    k_fp8, scale = kv
+    seq_len_kv = k_fp8.shape[0]
+    k = k_fp8.to(torch.bfloat16)
+    q = q.to(torch.bfloat16)
+
+    positions = torch.arange(seq_len_kv, device=q.device)[None, :]
+    mask = (positions >= cu_seqlen_ks[:, None]) & (
+        positions < cu_seqlen_ke[:, None]
+    )
+    score = torch.einsum("mhd,nd->hmn", q, k).float() * scale.reshape(-1)
+    logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
+    return logits.masked_fill(~mask, float("-inf"))
+
+
+def fp8_paged_mqa_logits_torch(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    """Reference paged FP8 MQA logits for CUDA without DeepGEMM."""
+    fp8_dtype = current_platform.fp8_dtype()
+    batch_size, next_n, _, dim = q.size()
+
+    # Fast path for the normal, non-speculative decode shape. It avoids
+    # dequantizing the entire cache and only gathers pages owned by each row.
+    if next_n == 1:
+        block_size = kv_cache.shape[1]
+        logits = torch.full(
+            (batch_size, max_model_len),
+            float("-inf"),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        if context_lens.dim() > 1:
+            context_lens = context_lens.squeeze(-1)
+        kv_cache_flat = kv_cache.view(-1, block_size * (dim + 4))
+        for i in range(batch_size):
+            seq_len = int(context_lens[i].item())
+            num_pages = cdiv(seq_len, block_size)
+            padded_seq_len = num_pages * block_size
+            pages = block_tables[i, :num_pages]
+            cache = kv_cache_flat[pages]
+            scale_offset = block_size * dim
+            cache_value = (
+                cache[..., :scale_offset].view(dtype=fp8_dtype).to(torch.float32)
+            ).view(padded_seq_len, dim)
+            cache_scale = (
+                cache[..., scale_offset:].view(dtype=torch.float32).contiguous()
+            ).view(padded_seq_len)
+            score = torch.nn.functional.linear(cache_value, q[i, 0].float())
+            score = (score.relu() * weights[i][None, :]).sum(dim=1)
+            logits[i, :seq_len] = score[:seq_len] * cache_scale[:seq_len]
+        return logits
+
+    kv_cache, scale = kv_cache[..., :dim], kv_cache[..., dim:]
+    scale = scale.contiguous().view(torch.float32)
+    q = q.float()
+    kv_cache = kv_cache.view(fp8_dtype).float() * scale
+    _, block_size, _, _ = kv_cache.size()
+    logits = torch.full(
+        (batch_size * next_n, max_model_len),
+        float("-inf"),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    for i in range(batch_size):
+        context_limit = context_lens[i]
+        if context_limit.ndim == 0:
+            context_len = int(context_limit.item())
+            context_limit = torch.full(
+                (next_n,), context_len, dtype=torch.int32, device=q.device
+            )
+        else:
+            context_limit = context_limit.to(device=q.device, dtype=torch.int32)
+        q_offsets = context_limit - 1
+        weight_slice = (
+            weights[i * next_n : (i + 1) * next_n].transpose(0, 1).contiguous()
+        )
+        max_context_len = int(context_limit.max().item())
+        for block_idx in range(cdiv(max_context_len, block_size)):
+            block_id = block_tables[i][block_idx]
+            qx, kx = q[i], kv_cache[block_id]
+            k_offsets = torch.arange(
+                block_idx * block_size,
+                (block_idx + 1) * block_size,
+                device=q.device,
+            )
+            mask = (k_offsets[None, :] < context_limit[:, None]) & (
+                k_offsets[None, :] <= q_offsets[:, None]
+            )
+            score = torch.where(
+                mask[None, :, :],
+                (qx.transpose(0, 1) @ kx.transpose(0, 1).transpose(1, 2)).to(
+                    logits.dtype
+                ),
+                float("-inf"),
+            )
+            score = (score.relu() * weight_slice[..., None]).sum(dim=0)
+            logits[
+                i * next_n : (i + 1) * next_n,
+                block_idx * block_size : (block_idx + 1) * block_size,
+            ] = torch.where(
+                k_offsets[None, :] <= q_offsets[:, None], score, float("-inf")
+            )
+    return logits
+
+
 def get_paged_mqa_logits_metadata(
     context_lens: torch.Tensor, block_size: int, num_sms: int
 ) -> torch.Tensor:
@@ -728,7 +846,9 @@ __all__ = [
     "m_grouped_fp8_fp4_gemm_nt_contiguous",
     "fp8_m_grouped_gemm_nt_masked",
     "fp8_fp4_mqa_logits",
+    "fp8_mqa_logits_torch",
     "fp8_fp4_paged_mqa_logits",
+    "fp8_paged_mqa_logits_torch",
     "get_paged_mqa_logits_metadata",
     "per_block_cast_to_fp8",
     "is_deep_gemm_e8m0_used",
