@@ -9,7 +9,7 @@
 > DeepSeek-V4-Flash, DeepSeek-V4-Flash-Vision-Exp, and GLM-5.3-Flash on
 > SM89/Ada and SM120/RTX Blackwell.
 
-The current source is based on vLLM `v0.28.1rc0-293` and is paired with
+The current source is a vLLM `0.28.1rc1.dev517` development build paired with
 FlashInfer `0.6.18`. Validated configurations include
 **4×/8× RTX 4090 48 GB** and **4× RTX PRO 6000 Blackwell 96 GB** systems.
 
@@ -23,6 +23,16 @@ FlashInfer `0.6.18`. Validated configurations include
 ---
 
 ## Changelog
+
+### 2026-09-07
+
+- Updated to the vLLM `0.28.1rc1` development series and published SM89+SM120 `vision8`
+  wheels.
+- Fixed the DeepSeek-V4 C128 sparse-attention crash caused by non-contiguous
+  indices reported in [Issue #98](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/98)
+  (PR #96).
+- Fixed persistent Top-K candidate-buffer overflow and incorrect index
+  selection (PR #97), and E8M0 scale compatibility in CUDA Triton block-FP8.
 
 ### 2026-09-02
 
@@ -68,7 +78,7 @@ Earlier SM89 builds and environments remain available in
 | PyTorch | 2.13.0+cu130 |
 | Triton | 3.7.1 |
 | FlashInfer | `0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213` |
-| vLLM | `0.28.1rc0.dev293+gcb7a435391.glm53.dsv4.vision7.sm89sm120.cu130` |
+| vLLM | `0.28.1rc1.dev517+glm53.dsv4.vision8.sm89sm120.cu130` |
 | SM89 | 4×/8× RTX 4090 48 GB |
 | SM120 | 4× RTX PRO 6000 Blackwell 96 GB |
 
@@ -83,14 +93,14 @@ shape is compiled once and then reused from the JIT cache.
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-gh release download v0.28.1rc0-vision-sm89-sm120-cu130 \
+gh release download v0.28.1rc1-vision8-sm89-sm120-cu130 \
   --repo yhfgyyf/vllm-deepseek-v4-sm89 \
   --pattern 'flashinfer_python-0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213-*.whl' \
   --pattern 'vllm-*glm53.dsv4.vision*.sm89sm120.cu130-*.whl' \
   --pattern SHA256SUMS \
-  --dir /tmp/vllm-sm89-sm120-vision-release
+  --dir /tmp/vllm-sm89-sm120-vision8-release
 
-cd /tmp/vllm-sm89-sm120-vision-release
+cd /tmp/vllm-sm89-sm120-vision8-release
 sha256sum -c SHA256SUMS
 
 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \

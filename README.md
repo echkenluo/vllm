@@ -8,7 +8,7 @@
 > SM89/Ada 与 SM120/RTX Blackwell 上运行 DeepSeek-V4-Flash、
 > DeepSeek-V4-Flash-Vision-Exp 和 GLM-5.3-Flash。
 
-当前代码基于 vLLM `v0.28.1rc0-293`，配套 FlashInfer `0.6.18`。已验证配置包括
+当前代码为 vLLM `0.28.1rc1.dev517` 开发版，配套 FlashInfer `0.6.18`。已验证配置包括
 **4×/8× RTX 4090 48GB** 和 **4× RTX PRO 6000 Blackwell 96GB**。
 
 ## 支持矩阵
@@ -21,6 +21,14 @@
 ---
 
 ## Changelog
+
+### 2026-09-07
+
+- 更新至 vLLM `0.28.1rc1` 开发版，发布 SM89+SM120 `vision8` wheel。
+- 修复 [Issue #98](https://github.com/yhfgyyf/vllm-deepseek-v4-sm89/issues/98)
+  中 DeepSeek-V4 C128 稀疏注意力索引不连续导致的崩溃（PR #96）。
+- 修复 persistent Top-K 候选缓冲区溢出导致的索引选择错误（PR #97），
+  并修复 CUDA Triton block-FP8 路径的 E8M0 scale 兼容性。
 
 ### 2026-09-03
 
@@ -72,7 +80,7 @@
 | PyTorch | 2.13.0+cu130 |
 | Triton | 3.7.1 |
 | FlashInfer | `0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213` |
-| vLLM | `0.28.1rc0.dev293+gcb7a435391.glm53.dsv4.vision7.sm89sm120.cu130` |
+| vLLM | `0.28.1rc1.dev517+glm53.dsv4.vision8.sm89sm120.cu130` |
 | SM89 | 4×/8× RTX 4090 48GB |
 | SM120 | 4× RTX PRO 6000 Blackwell 96GB |
 
@@ -89,14 +97,14 @@ FlashInfer wheel 是 Python/JIT 源码包。首次遇到新的模型 shape 时�
 uv venv --python 3.12 --seed
 source .venv/bin/activate
 
-gh release download v0.28.1rc0-vision-sm89-sm120-cu130 \
+gh release download v0.28.1rc1-vision8-sm89-sm120-cu130 \
   --repo yhfgyyf/vllm-deepseek-v4-sm89 \
   --pattern 'flashinfer_python-0.6.18+glm53.dsv4.vision1.sm89sm120.cu130.pt213-*.whl' \
   --pattern 'vllm-*glm53.dsv4.vision*.sm89sm120.cu130-*.whl' \
   --pattern SHA256SUMS \
-  --dir /tmp/vllm-sm89-sm120-vision-release
+  --dir /tmp/vllm-sm89-sm120-vision8-release
 
-cd /tmp/vllm-sm89-sm120-vision-release
+cd /tmp/vllm-sm89-sm120-vision8-release
 sha256sum -c SHA256SUMS
 
 UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple \
