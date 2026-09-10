@@ -79,6 +79,7 @@ class TPComm:
         self.enabled = enabled()
         self.mode = os.getenv("DSV4_TP_COMM_MODE", "bf16")
         self.min_tokens = int(os.getenv("DSV4_TP_COMM_MIN_TOKENS", "512"))
+        self.embedding_rs = os.getenv("DSV4_TP_COMM_EMBED_RS", "1") == "1"
         self.stats: Counter[str] = Counter()
         if self.mode not in MODES or self.min_tokens < 1:
             raise ValueError("Invalid DSV4_TP_COMM mode or token threshold")
@@ -120,6 +121,16 @@ class TPComm:
         self.stats["rows"] += rows
         self.stats["mixed_forwards"] += int(getattr(meta, "num_decodes", 0) > 0)
         return self.mode
+
+    def embed(self, embedding, input_ids: torch.Tensor, mode: str):
+        if not self.embedding_rs or mode == "preserve_ar":
+            self.stats["embedding_ar_shard"] += 1
+            return sp_shard(embedding(input_ids)).contiguous()
+        partial = embedding.forward_unreduced(input_ids)
+        if partial.dtype != torch.bfloat16:
+            raise ValueError("DSV4 TP entry reduction requires BF16 embeddings")
+        self.stats["embedding_bf16_rs"] += 1
+        return get_tp_group().reduce_scatter(_pad(partial), dim=0)
 
     def gather(self, x: torch.Tensor, rows: int, mode: str, site: str):
         group = get_tp_group()
