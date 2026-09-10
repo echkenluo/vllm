@@ -81,10 +81,46 @@ class CommWorker:
                         assert torch.equal(result, state)
                     decoded = _unpack(_pack(local), hidden, rows, torch.float32)
                     blocks = local.float().view(rows, hidden // GROUP, GROUP)
-                    scale = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-10)
-                    scale = scale / 448.0
+                    # Tensor / constant in FP32 can multiply a rounded
+                    # reciprocal. CUDA computes absmax / max_8bit instead;
+                    # one ULP in scale changes FP8 midpoint rounding.
+                    scale = blocks.double().abs().amax(-1, keepdim=True)
+                    scale = (scale.clamp_min(1e-10) / 448.0).float()
                     oracle = (blocks / scale).to(torch.float8_e4m3fn).float() * scale
                     torch.testing.assert_close(
                         decoded, oracle.reshape(rows, hidden), rtol=1e-5, atol=1e-6
                     )
         return {"rank": group.rank_in_group, "passed": True, "records": records}
+
+
+if __name__ == "__main__":
+    import json
+    import os
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from vllm.distributed import (
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+    from vllm.models.deepseek_v4.nvidia.tp_comm import TPComm
+
+    rank = int(os.environ["RANK"])
+    world = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.accelerator.set_device_index(local_rank)
+    init_distributed_environment(world, rank, "env://", local_rank)
+    initialize_model_parallel(world, 1)
+    # Exercise the operators before allocating model weights or KV cache.
+    # Direct operator calls do not use the model forward admission gate.
+    os.environ["DSV4_TP_COMM"] = "0"
+    controller = TPComm(None)
+    worker = CommWorker()
+    worker.model_runner = SimpleNamespace(
+        get_model=lambda: SimpleNamespace(model=SimpleNamespace(tp_comm=controller))
+    )
+    result = worker.dsv4_comm_wire_gate()
+    output = Path(os.environ["COMM_GATE_OUTPUT"])
+    output.mkdir(parents=True, exist_ok=True)
+    (output / f"rank-{rank}.json").write_text(json.dumps(result, indent=2) + "\n")
+    print(f"WIRE_GATE_PASS rank={rank}", flush=True)
