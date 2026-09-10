@@ -99,7 +99,9 @@ if __name__ == "__main__":
     from pathlib import Path
     from types import SimpleNamespace
 
+    from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
     from vllm.distributed import (
+        destroy_distributed_environment,
         init_distributed_environment,
         initialize_model_parallel,
     )
@@ -109,17 +111,23 @@ if __name__ == "__main__":
     world = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.accelerator.set_device_index(local_rank)
-    init_distributed_environment(world, rank, "env://", local_rank)
-    initialize_model_parallel(world, 1)
-    # Exercise the operators before allocating model weights or KV cache.
-    # Direct operator calls do not use the model forward admission gate.
-    os.environ["DSV4_TP_COMM"] = "0"
-    controller = TPComm(None)
-    worker = CommWorker()
-    worker.model_runner = SimpleNamespace(
-        get_model=lambda: SimpleNamespace(model=SimpleNamespace(tp_comm=controller))
-    )
-    result = worker.dsv4_comm_wire_gate()
+    config = VllmConfig(parallel_config=ParallelConfig(tensor_parallel_size=world))
+    with set_current_vllm_config(config):
+        init_distributed_environment(world, rank, "env://", local_rank)
+        initialize_model_parallel(world, 1)
+        try:
+            # Direct operator calls do not use model forward admission.
+            os.environ["DSV4_TP_COMM"] = "0"
+            controller = TPComm(None)
+            worker = CommWorker()
+            worker.model_runner = SimpleNamespace(
+                get_model=lambda: SimpleNamespace(
+                    model=SimpleNamespace(tp_comm=controller)
+                )
+            )
+            result = worker.dsv4_comm_wire_gate()
+        finally:
+            destroy_distributed_environment()
     output = Path(os.environ["COMM_GATE_OUTPUT"])
     output.mkdir(parents=True, exist_ok=True)
     (output / f"rank-{rank}.json").write_text(json.dumps(result, indent=2) + "\n")
