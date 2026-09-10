@@ -1444,9 +1444,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        full_num_tokens = positions.shape[0]
+        comm_mode = None
+        if self.tp_comm.enabled:
+            comm_mode = self.tp_comm.begin(
+                full_num_tokens,
+                self.layers[self.start_layer].attn.swa_cache_layer.prefix,
+            )
+        entry_sharded = False
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
+            elif comm_mode is not None:
+                hidden_states = self.tp_comm.embed(
+                    self.embed_tokens, input_ids, comm_mode
+                )
+                entry_sharded = True
             else:
                 hidden_states = self.embed_input_ids(input_ids)
         else:
@@ -1456,14 +1469,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
 
-        full_num_tokens = positions.shape[0]
-        comm_mode = None
-        if self.tp_comm.enabled:
-            comm_mode = self.tp_comm.begin(
-                full_num_tokens,
-                self.layers[self.start_layer].attn.swa_cache_layer.prefix,
-            )
-        if comm_mode is not None:
+        if comm_mode is not None and not entry_sharded:
+            self.tp_comm.stats["embedding_replicated_shard"] += 1
             hidden_states = sp_shard(hidden_states).contiguous()
         if self.use_sequence_parallel:
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():

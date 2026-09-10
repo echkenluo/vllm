@@ -497,6 +497,13 @@ class VocabParallelEmbedding(PluggableLayer):
         param[loaded_weight.shape[0] :].data.fill_(0)
 
     def forward(self, input_):
+        return self._forward(input_, reduce_results=True)
+
+    def forward_unreduced(self, input_):
+        """Return the masked local vocabulary contribution for deferred reduction."""
+        return self._forward(input_, reduce_results=False)
+
+    def _forward(self, input_, reduce_results: bool):
         if self.tp_size == 1:
             return self.quant_method.embedding(self, input_.long())
 
@@ -531,11 +538,19 @@ class VocabParallelEmbedding(PluggableLayer):
                 # Each vocab token has one owner, so FP8 bytes can use int8 SUM.
                 comm_output = output_parallel.view(torch.int8)
                 comm_output.masked_fill_(input_mask.unsqueeze(-1), 0)
-                output = tensor_model_parallel_all_reduce(comm_output)
+                output = (
+                    tensor_model_parallel_all_reduce(comm_output)
+                    if reduce_results
+                    else comm_output
+                )
                 return output.view(output_parallel.dtype)
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         # Reduce across all the model parallel GPUs.
-        return tensor_model_parallel_all_reduce(output_parallel)
+        return (
+            tensor_model_parallel_all_reduce(output_parallel)
+            if reduce_results
+            else output_parallel
+        )
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings}"

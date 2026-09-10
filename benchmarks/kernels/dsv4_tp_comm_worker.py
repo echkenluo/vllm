@@ -15,7 +15,7 @@ from vllm.models.deepseek_v4.nvidia.tp_comm import GROUP, MODES, _pack, _unpack
 
 
 class CommWorker:
-    def dsv4_comm_mode(self, mode: str = "", reset: str = "0"):
+    def dsv4_comm_mode(self, mode: str = "", reset: str = "0", embedding_rs: str = ""):
         model = self.model_runner.get_model().model
         comm = model.tp_comm
         assert comm.enabled
@@ -26,10 +26,15 @@ class CommWorker:
             comm.mode = mode
         if reset == "1":
             comm.stats.clear()
+        if embedding_rs:
+            if embedding_rs not in ("0", "1"):
+                raise ValueError(embedding_rs)
+            comm.embedding_rs = embedding_rs == "1"
         return {
             "rank": get_tp_group().rank_in_group,
             "mode": comm.mode,
             "min_tokens": comm.min_tokens,
+            "embedding_rs": comm.embedding_rs,
             "stats": dict(comm.stats),
             "aux_layers": list(model.aux_hidden_state_layers),
             "layers": model.end_layer - model.start_layer,
@@ -91,6 +96,30 @@ class CommWorker:
                         decoded, oracle.reshape(rows, hidden), rtol=1e-5, atol=1e-6
                     )
         return {"rank": group.rank_in_group, "passed": True, "records": records}
+
+    def dsv4_comm_embedding_gate(self):
+        """Prove exact entry reduction with loaded vocabulary shards."""
+        model = self.model_runner.get_model().model
+        comm, embedding = model.tp_comm, model.embed_tokens
+        previous = comm.embedding_rs
+        records = []
+        try:
+            for rows in (1, 7, 8, 511, 512, 513, 4096):
+                ids = (torch.arange(rows, device="cuda") * 7919) % model.vocab_size
+                full = embedding(ids)
+                expected = sp_shard(full).contiguous()
+                for enabled in (False, True):
+                    comm.embedding_rs = enabled
+                    actual = comm.embed(embedding, ids, "fp8_both")
+                    assert torch.equal(actual, expected)
+                    records.append({"rows": rows, "entry_rs": enabled, "exact": True})
+        finally:
+            comm.embedding_rs = previous
+        return {
+            "rank": get_tp_group().rank_in_group,
+            "passed": True,
+            "records": records,
+        }
 
 
 if __name__ == "__main__":
