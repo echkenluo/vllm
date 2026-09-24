@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -44,6 +45,11 @@ elif current_platform.is_xpu():
 logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+
+# GLM53_TILELANG_INDEXER=1 computes the decode paged FP8 MQA logits on SM89
+# with a TileLang FP8-MMA kernel instead of the Triton TF32 fallback that
+# fp8_fp4_paged_mqa_logits dispatches to there (sm12x_mqa.py).
+_USE_TILELANG_PAGED_LOGITS = os.getenv("GLM53_TILELANG_INDEXER", "0") == "1"
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -809,18 +815,51 @@ def sparse_attn_indexer_kpool(
                 max_model_len=max_model_len,
             )
         else:
-            from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
+            tl_logits = None
+            if (
+                _USE_TILELANG_PAGED_LOGITS
+                and padded_q_scale is None
+                and current_platform.is_device_capability((8, 9))
+            ):
+                from vllm.models.glm5next.nvidia.ops.tilelang_paged_mqa_logits import (  # noqa: E501
+                    tilelang_fp8_paged_mqa_logits,
+                )
 
-            logits = fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
-                kv_cache,
-                padded_weights[:num_padded_tokens],
-                seq_lens,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
-                clean_logits=False,
-            )
+                # Returns None for layouts it does not handle; the default
+                # path below then runs unchanged.
+                tl_logits = tilelang_fp8_paged_mqa_logits(
+                    padded_q_quant_cast,
+                    kv_cache,
+                    padded_weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    max_model_len,
+                )
+                if tl_logits is None:
+                    logger.warning_once(
+                        "GLM53_TILELANG_INDEXER=1 but the indexer cache layout "
+                        "is not supported by the TileLang kernel; using the "
+                        "default paged MQA logits path."
+                    )
+                else:
+                    logger.info_once(
+                        "GLM indexer decode: TileLang FP8 paged MQA logits."
+                    )
+            if tl_logits is not None:
+                logits = tl_logits
+            else:
+                from vllm.utils.deep_gemm import fp8_fp4_paged_mqa_logits
+
+                logits = fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    padded_weights[:num_padded_tokens],
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_model_len,
+                    clean_logits=False,
+                )
         num_rows = logits.shape[0]
         # kpool: logits are pool-granular -> select topk_tokens//kpool pools,
         # then expand each pool back to its kpool tokens.
