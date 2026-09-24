@@ -60,6 +60,8 @@ MLA_LAYERS_PER_TARGET_FORWARD = 11
 
 
 def _imports():
+    # Registers torch.ops._C.* (persistent_topk is compared below).
+    import vllm._custom_ops  # noqa: F401
     from vllm.models.glm5next.nvidia.ops.kpool_compress import (
         fwht128_quant_fp8,
         kpool_compress_and_write_cache,
@@ -308,7 +310,9 @@ def check_ok(m: dict, args) -> list[str]:
         bad.append(f"max_norm_diff={m['max_norm_diff']:.3e}>{args.norm_tol}")
     if m["topk_overlap_min"] < args.overlap_min:
         bad.append(f"topk_overlap_min={m['topk_overlap_min']:.4f}")
-    if m.get("ptopk") != "unavailable":
+    if m.get("ptopk") == "unavailable":
+        bad.append("ptopk=unavailable")
+    else:
         if m["ptopk_overlap_min"] < args.overlap_min:
             bad.append(f"ptopk_overlap_min={m['ptopk_overlap_min']:.4f}")
         if m["ptopk_out_of_range"]:
