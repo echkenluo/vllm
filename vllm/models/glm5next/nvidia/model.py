@@ -14,6 +14,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
@@ -79,6 +80,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_reduce_scatter,
     sp_shard,
 )
+from vllm.models.deepseek_v4.nvidia.tp_comm import TPComm
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -156,6 +158,7 @@ class Glm5NextMoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         apply_routed_scale_to_output: bool = False,
+        defer_tp_reduce: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -223,6 +226,7 @@ class Glm5NextMoE(nn.Module):
             )
 
         self.experts = FusedMoEFactory(
+            reduce_results=not defer_tp_reduce,
             shared_experts=self.shared_experts,
             gate=self.gate,
             num_experts=config.n_routed_experts,
@@ -284,6 +288,7 @@ class Glm5NextDecoderLayer(nn.Module):
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
         is_mtp_layer: bool = False,
+        tp_comm: TPComm | None = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -302,6 +307,14 @@ class Glm5NextDecoderLayer(nn.Module):
         self.mhc = config.mhc
         self.layer_kind = "kda" if config.is_kda_layer(layer_idx) else "mla"
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        # Token-scattered TP (DSV4_TP_COMM): the decoder layer owns the TP
+        # reduction of attention and MLP outputs, as in the DSv4 port.
+        self.tp_comm = tp_comm
+        self.defer_tp_reduce = (
+            tp_comm is not None and tp_comm.enabled and not is_mtp_layer
+        )
+        if self.defer_tp_reduce and (self.is_sequence_parallel or not self.mhc):
+            raise ValueError("DSV4_TP_COMM needs the mHC path without SP MoE")
 
         if config.is_kda_layer(layer_idx):
             self.self_attn = Glm5NextLinearAttention(
@@ -347,6 +360,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                defer_tp_reduce=self.defer_tp_reduce,
             )
         else:
             self.mlp = Glm5NextMLP(
@@ -354,6 +368,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=not self.defer_tp_reduce,
                 prefix=f"{prefix}.mlp",
                 swiglu_limit=config.swiglu_limit,
             )
@@ -364,7 +379,7 @@ class Glm5NextDecoderLayer(nn.Module):
         # decoder-layer reduce_scatter after attention completes it (DSv4 pattern).
         # MTP layers use the non-mHC path which has no sp_reduce_scatter, so
         # their o_proj must still reduce normally.
-        if self.is_sequence_parallel and not is_mtp_layer:
+        if (self.is_sequence_parallel and not is_mtp_layer) or self.defer_tp_reduce:
             self.self_attn.o_proj.reduce_results = False
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -410,6 +425,7 @@ class Glm5NextDecoderLayer(nn.Module):
         residual: torch.Tensor | None = None,
         post: torch.Tensor | None = None,
         comb: torch.Tensor | None = None,
+        comm_mode: str | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -472,6 +488,9 @@ class Glm5NextDecoderLayer(nn.Module):
         # shard. Gather for attention, scatter back afterward (DSv4 pattern).
         if self.is_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
+        elif comm_mode is not None:
+            assert self.tp_comm is not None
+            x = self.tp_comm.gather(x, positions.shape[0], comm_mode, "attn")
 
         x = self.self_attn(
             hidden_states=x,
@@ -480,6 +499,11 @@ class Glm5NextDecoderLayer(nn.Module):
 
         if self.is_sequence_parallel:
             x = sp_reduce_scatter(x)
+        elif comm_mode is not None:
+            assert self.tp_comm is not None
+            x = self.tp_comm.reduce(x, comm_mode, "attn")
+        elif self.defer_tp_reduce:
+            x = tensor_model_parallel_all_reduce(x)
 
         # Fuse post-attn hc_post + pre-FFN hc_pre (+ RMSNorm) into one kernel.
         residual, post, comb, x = self.hc_fused_post_pre(
@@ -495,10 +519,18 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
         # Fully Connected
+        if comm_mode is not None:
+            assert self.tp_comm is not None
+            x = self.tp_comm.gather(x, positions.shape[0], comm_mode, "moe")
         if self._mlp_is_moe:
             x = self.mlp(x, already_sequence_parallel=self.is_sequence_parallel)
         else:
             x = self.mlp(x)
+        if comm_mode is not None:
+            assert self.tp_comm is not None
+            x = self.tp_comm.reduce(x, comm_mode, "moe")
+        elif self.defer_tp_reduce:
+            x = tensor_model_parallel_all_reduce(x)
 
         # mHC end. The last mHC layer materializes its final hc_post (nothing
         # to fuse with) then contracts; every other layer defers its hc_post to
@@ -627,6 +659,8 @@ class Glm5NextModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        self.tp_comm = TPComm(vllm_config)
+
         def get_layer(prefix: str):
             layer_idx = int(prefix.rsplit(".", 1)[1])
             return Glm5NextDecoderLayer(
@@ -635,6 +669,7 @@ class Glm5NextModel(nn.Module):
                 layer_idx=layer_idx,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
+                tp_comm=self.tp_comm,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
@@ -645,6 +680,17 @@ class Glm5NextModel(nn.Module):
         # The active slice is fixed after construction; cache it so forward
         # doesn't rebuild the slice (a fresh list) every step.
         self._active_layers = self.layers[self.start_layer : self.end_layer]
+        # GDN metadata of a KDA layer carries num_prefills for the prefill check.
+        self._tp_comm_metadata_key = next(
+            (
+                layer.self_attn.prefix
+                for layer in self._active_layers
+                if layer.layer_kind == "kda"
+            ),
+            None,
+        )
+        if self.tp_comm.enabled and self._tp_comm_metadata_key is None:
+            raise ValueError("DSV4_TP_COMM needs a KDA layer for prefill detection")
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -671,9 +717,19 @@ class Glm5NextModel(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        full_num_tokens = positions.shape[0]
+        comm_mode = None
+        if self.tp_comm.enabled:
+            comm_mode = self.tp_comm.begin(full_num_tokens, self._tp_comm_metadata_key)
+        entry_sharded = False
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
+            elif comm_mode is not None:
+                hidden_states = self.tp_comm.embed(
+                    self.embed_tokens, input_ids, comm_mode
+                )
+                entry_sharded = True
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
@@ -688,13 +744,15 @@ class Glm5NextModel(nn.Module):
             post = None
             comb = None
 
-        full_num_tokens = positions.shape[0]
+        if comm_mode is not None and not entry_sharded:
+            self.tp_comm.stats["embedding_replicated_shard"] += 1
+            hidden_states = sp_shard(hidden_states).contiguous()
         if self.is_sequence_parallel:
             hidden_states = sp_shard(hidden_states)
 
         for layer in self._active_layers:
             hidden_states, residual, post, comb = layer(
-                positions, hidden_states, residual, post, comb
+                positions, hidden_states, residual, post, comb, comm_mode
             )
 
         if not get_pp_group().is_last_rank:
@@ -709,6 +767,10 @@ class Glm5NextModel(nn.Module):
 
         if self.is_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+        elif comm_mode is not None:
+            hidden_states = self.tp_comm.gather(
+                hidden_states, full_num_tokens, comm_mode, "head"
+            )
 
         hidden_states = self.norm(hidden_states)
         return hidden_states

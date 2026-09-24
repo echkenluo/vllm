@@ -14,9 +14,15 @@ from vllm.models.common.ops.sequence_parallel import sp_shard
 from vllm.models.deepseek_v4.nvidia.tp_comm import GROUP, MODES, _pack, _unpack
 
 
+def _text_model(worker):
+    """DSv4 keeps the decoder at .model; GLM-5.3 nests it under .language_model."""
+    top = worker.model_runner.get_model()
+    return getattr(top, "language_model", top).model
+
+
 class CommWorker:
     def dsv4_comm_mode(self, mode: str = "", reset: str = "0", embedding_rs: str = ""):
-        model = self.model_runner.get_model().model
+        model = _text_model(self)
         comm = model.tp_comm
         assert comm.enabled
         torch.accelerator.synchronize()
@@ -36,13 +42,13 @@ class CommWorker:
             "min_tokens": comm.min_tokens,
             "embedding_rs": comm.embedding_rs,
             "stats": dict(comm.stats),
-            "aux_layers": list(model.aux_hidden_state_layers),
+            "aux_layers": list(getattr(model, "aux_hidden_state_layers", ())),
             "layers": model.end_layer - model.start_layer,
         }
 
     def dsv4_comm_wire_gate(self):
         """Check row order, padding, zero scales and independent FP8 arithmetic."""
-        comm = self.model_runner.get_model().model.tp_comm
+        comm = _text_model(self).tp_comm
         group = get_tp_group()
         records = []
         with torch.random.fork_rng(devices=[torch.accelerator.current_device_index()]):
@@ -99,7 +105,7 @@ class CommWorker:
 
     def dsv4_comm_embedding_gate(self):
         """Prove exact entry reduction with loaded vocabulary shards."""
-        model = self.model_runner.get_model().model
+        model = _text_model(self)
         comm, embedding = model.tp_comm, model.embed_tokens
         previous = comm.embedding_rs
         records = []
