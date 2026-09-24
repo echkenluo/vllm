@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Iterable
 from typing import ClassVar, Literal
 
@@ -95,6 +96,10 @@ from .multimodal import (
 )
 
 logger = init_logger(__name__)
+
+# GLM53_MHC_FUSE_POST_PRE=0 runs hc_post and the next hc_pre as two kernels
+# instead of the inter-layer fused kernel (the SGLang line found fusion slower).
+_FUSE_MHC_POST_PRE = os.getenv("GLM53_MHC_FUSE_POST_PRE", "1") != "0"
 
 
 class Glm5NextMLP(nn.Module):
@@ -587,6 +592,19 @@ class Glm5NextDecoderLayer(nn.Module):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ):
+        if not _FUSE_MHC_POST_PRE:
+            # Same contract as the fused op: hc_post, then hc_pre on the
+            # updated residual streams (A/B against the fused kernel).
+            residual = self.hc_post(x, residual, post, comb)
+            post, comb, x = self.hc_pre(
+                residual,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+            )
+            return residual, post, comb, x
         return self.mhc_fused_post_pre_op(
             x=x,
             residual=residual,
