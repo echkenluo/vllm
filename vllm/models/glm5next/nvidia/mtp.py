@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 import typing
 from collections.abc import Callable, Iterable
 
@@ -30,20 +29,15 @@ from .model import (
     Glm5NextDecoderLayer,
     Glm5NextMLAAttention,
     Glm5NextMoE,
+    _DRAFT_FP8,
     _MLA_FP8_DECODE,
     _try_load_fp8_attn_proj,
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
 from .ops import mla_fp8_decode
-from .ops.fp8_weight_only import Fp8LMHeadProxy, Fp8MarlinWeight
+from .ops.fp8_weight_only import Fp8MarlinWeight
 from .ops.fused_eh_norm import fused_eh_norm
-
-# GLM53_DRAFT_FP8=1: the MTP draft reads weight-only FP8 (Marlin) copies of its
-# eh_proj and of the shared lm_head shard instead of the BF16 weights. Only
-# the draft changes; the target model still verifies every token with its
-# BF16 lm_head. Off by default.
-_DRAFT_FP8 = os.getenv("GLM53_DRAFT_FP8", "0") == "1"
 
 
 class Glm5NextMultiTokenPredictorLayer(nn.Module):
@@ -154,26 +148,36 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             assert isinstance(self_attn, Glm5NextMLAAttention)
             self._mtp_mla_attns.append(self_attn.mla_attn)
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self._draft_fp8_ready = False
 
-    def _build_draft_fp8(self) -> None:
-        """Build the FP8 eh_proj and lm_head copies once, on the first
-        (eager, profile-run) draft forward: after the lm_head has been
-        shared with the target model and before CUDA graph capture."""
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "GLM53_DRAFT_FP8: the FP8 draft weights must be built before "
-                "CUDA graph capture, but the first draft forward is being captured"
-            )
+    def build_draft_fp8_eh_proj(self) -> None:
+        """GLM53_DRAFT_FP8: replace each eh_proj's BF16 weight by an FP8
+        Marlin copy, at the end of weight loading (before the memory
+        profile). The BF16 weight is freed: only the draft forward reads it."""
         head_dtype = self.logits_processor.head_dtype
         if head_dtype not in (None, torch.bfloat16):
             raise RuntimeError(f"GLM53_DRAFT_FP8 needs a BF16 lm_head, not {head_dtype}")
         for layer in self._mtp_layers:
-            # Plain attributes, not registered submodules: they are derived
-            # copies and must stay out of weight loading and state dicts.
-            object.__setattr__(layer, "_eh_fp8", Fp8MarlinWeight(layer.eh_proj.weight.data))
-            object.__setattr__(layer, "_head_fp8", Fp8LMHeadProxy(layer.shared_head.head))
-        self._draft_fp8_ready = True
+            w = layer.eh_proj.weight
+            if w.dtype != torch.bfloat16:
+                raise RuntimeError(f"GLM53_DRAFT_FP8 needs a BF16 eh_proj, not {w.dtype}")
+            # Plain attribute, not a registered submodule: a derived copy that
+            # must stay out of weight loading and state dicts.
+            object.__setattr__(layer, "_eh_fp8", Fp8MarlinWeight(w.data))
+            w.data = torch.empty(0, dtype=w.dtype, device=w.device)
+
+    def _draft_head(self, mtp_layer):
+        head = mtp_layer.shared_head.head
+        if not _DRAFT_FP8:
+            return head
+        # The FP8 copy is built on the target model's lm_head, which the
+        # proposer shares into shared_head.head after loading.
+        proxy = getattr(head, "_glm53_fp8_proxy", None)
+        if proxy is None:
+            raise RuntimeError(
+                "GLM53_DRAFT_FP8: shared_head.head has no FP8 copy; the draft "
+                "must share the target model's lm_head"
+            )
+        return proxy
 
     def set_skip_topk(self, skip: bool):
         # index_share_for_mtp_iteration: step 0 computes top-k, steps 1+ reuse.
@@ -199,8 +203,6 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        if _DRAFT_FP8 and not self._draft_fp8_ready:
-            self._build_draft_fp8()
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
@@ -222,8 +224,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         # hidden_states is already post-final-norm (produced in the layer
         # forward and recycled as-is); apply the LM head only, without a
         # second RMSNorm.
-        head = mtp_layer._head_fp8 if _DRAFT_FP8 else mtp_layer.shared_head.head
-        return self.logits_processor(head, hidden_states)
+        return self.logits_processor(self._draft_head(mtp_layer), hidden_states)
 
     def get_top_tokens(
         self,
@@ -238,8 +239,9 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         # step. Tie-breaking matches the full argmax (shards are contiguous
         # and rank-ordered, so the lowest-rank winner is the lowest global
         # index), so greedy draft tokens are unchanged.
-        head = mtp_layer._head_fp8 if _DRAFT_FP8 else mtp_layer.shared_head.head
-        return self.logits_processor.get_top_tokens(head, hidden_states)
+        return self.logits_processor.get_top_tokens(
+            self._draft_head(mtp_layer), hidden_states
+        )
 
 
 class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
@@ -463,4 +465,6 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 )
         if _MLA_FP8_DECODE:
             mla_fp8_decode.install(self)
+        if _DRAFT_FP8:
+            self.model.build_draft_fp8_eh_proj()
         return loaded_params
