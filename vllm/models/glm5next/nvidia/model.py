@@ -112,6 +112,11 @@ _MLA_FP8_DECODE = os.getenv("GLM53_MLA_FP8_DECODE", "0") == "1"
 # target keeps verifying with the BF16 lm_head. Both copies are built while
 # loading weights, before vLLM measures memory for the KV cache. Off by default.
 _DRAFT_FP8 = os.getenv("GLM53_DRAFT_FP8", "0") == "1"
+# GLM53_ROUTER_ONCE=1: skip the router GEMM in Glm5NextMoE.forward. The MoE
+# runner holds self.gate and computes the router logits itself
+# (moe_runner.py, "If the Runner holds the gate"), overwriting the ones passed
+# in, so every MoE layer ran the router GEMM twice. Off by default.
+_ROUTER_ONCE = os.getenv("GLM53_ROUTER_ONCE", "0") == "1"
 
 
 class Glm5NextMLP(nn.Module):
@@ -280,12 +285,17 @@ class Glm5NextMoE(nn.Module):
         if self.is_sequence_parallel and not already_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        # The router is always external (self.gate); main's MoERunner expects
-        # pre-computed router_logits, so compute them here unconditionally.
-        router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
+        if _ROUTER_ONCE:
+            # The runner applies self.gate; router_logits is only a placeholder,
+            # as in deepseek_v2.
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=hidden_states
+            )
+        else:
+            router_logits, _ = self.gate(hidden_states)
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
 
         if self.is_sequence_parallel and not already_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
