@@ -90,6 +90,7 @@ from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 from .attention import Glm5NextMLAAttention
 from .kda import Glm5NextLinearAttention
 from .ops import mla_fp8_decode
+from .ops.fp8_weight_only import Fp8LMHeadProxy
 from .multimodal import (
     Glm5NextMultiModalProcessor,
     Glm5NextProcessingInfo,
@@ -102,9 +103,15 @@ logger = init_logger(__name__)
 # instead of the inter-layer fused kernel (the SGLang line found fusion slower).
 _FUSE_MHC_POST_PRE = os.getenv("GLM53_MHC_FUSE_POST_PRE", "1") != "0"
 # GLM53_MLA_FP8_DECODE=1: keep the MLA projections' checkpoint FP8 block scales
-# while loading and give decode-sized batches weight-only FP8 (Marlin) copies
-# of fused_qkv_a / q_b / o_proj (ops/mla_fp8_decode.py). Off by default.
+# while loading and run fused_qkv_a / q_b / o_proj on weight-only FP8 (Marlin)
+# weights rebuilt from them, freeing the BF16 copies (ops/mla_fp8_decode.py).
+# Off by default.
 _MLA_FP8_DECODE = os.getenv("GLM53_MLA_FP8_DECODE", "0") == "1"
+# GLM53_DRAFT_FP8=1: the MTP draft reads weight-only FP8 (Marlin) copies of its
+# eh_proj and of the lm_head shard it shares with the target model. The
+# target keeps verifying with the BF16 lm_head. Both copies are built while
+# loading weights, before vLLM measures memory for the KV cache. Off by default.
+_DRAFT_FP8 = os.getenv("GLM53_DRAFT_FP8", "0") == "1"
 
 
 class Glm5NextMLP(nn.Module):
@@ -1049,7 +1056,22 @@ class Glm5NextForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        if _DRAFT_FP8 and self.vllm_config.speculative_config is not None:
+            # The MTP draft shares this lm_head module (see
+            # _maybe_share_lm_head in the spec-decode proposer), so the FP8
+            # copy hangs off it as a plain attribute: not a submodule, it
+            # stays out of weight loading and state dicts. Built here rather
+            # than on the first draft forward so that its quantization
+            # temporaries are gone before the memory profile.
+            if self.lm_head.weight.dtype != torch.bfloat16:
+                raise RuntimeError(
+                    "GLM53_DRAFT_FP8 needs a BF16 lm_head, not "
+                    f"{self.lm_head.weight.dtype}"
+                )
+            self.lm_head._glm53_fp8_proxy = Fp8LMHeadProxy(self.lm_head)
+            logger.info("GLM53_DRAFT_FP8: FP8 copy of the lm_head shard for the draft")
+        return loaded
 
 
 @MULTIMODAL_REGISTRY.register_processor(

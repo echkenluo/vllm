@@ -23,15 +23,29 @@ _FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 
 class Fp8MarlinWeight(nn.Module):
-    """Marlin-packed FP8 copy of a BF16 [N, K] weight, per-output-channel scale."""
+    """Marlin-packed FP8 copy of a BF16 [N, K] weight, per-output-channel scale.
+
+    Quantized CHUNK_ROWS rows at a time: the result is the same as doing it in
+    one go (every step is per row), but the FP32 temporaries stay at
+    CHUNK_ROWS x K instead of two full N x K copies (634 MB for the lm_head
+    shard)."""
+
+    CHUNK_ROWS = 2048
 
     def __init__(self, weight: torch.Tensor):
         super().__init__()
         n, k = weight.shape
-        w = weight.detach().float()
-        scale = (w.abs().amax(dim=1).clamp(min=1e-12) / _FP8_MAX).float()
-        q = (w / scale[:, None]).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
-        del w
+        src = weight.detach()
+        q = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=src.device)
+        scale = torch.empty(n, dtype=torch.float32, device=src.device)
+        for r in range(0, n, self.CHUNK_ROWS):
+            w = src[r : r + self.CHUNK_ROWS].float()
+            s = w.abs().amax(dim=1).clamp(min=1e-12) / _FP8_MAX
+            q[r : r + self.CHUNK_ROWS] = (
+                (w / s[:, None]).clamp(-_FP8_MAX, _FP8_MAX).to(torch.float8_e4m3fn)
+            )
+            scale[r : r + self.CHUNK_ROWS] = s
+            del w, s
         self.weight = nn.Parameter(q, requires_grad=False)
         self.weight_scale = nn.Parameter(scale, requires_grad=False)
         self.output_size_per_partition = n
