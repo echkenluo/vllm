@@ -1,8 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
+from vllm.model_executor.kernels.mhc import prenorm_tiled
 from vllm.utils.torch_utils import direct_register_custom_op
+
+# GLM53_MHC_PRENORM_TILED=1: on the non-DeepGEMM path, batches of at least
+# prenorm_tiled.MIN_TOKENS tokens compute the mhc_pre FP32 pre-norm GEMM with
+# the token-tiled Triton kernel in prenorm_tiled.py (K split into partial sums
+# that the big-fuse kernel adds). Off by default; decode-sized batches are
+# unchanged either way.
+_PRENORM_TILED = os.getenv("GLM53_MHC_PRENORM_TILED", "0") == "1"
 
 
 def _torch_hc_prenorm_gemm(
@@ -165,11 +175,16 @@ def mhc_pre_tilelang(
     from vllm.utils.deep_gemm import is_deep_gemm_supported
 
     use_deep_gemm = is_deep_gemm_supported()
+    use_tiled = (
+        not use_deep_gemm and _PRENORM_TILED and num_tokens >= prenorm_tiled.MIN_TOKENS
+    )
     if use_deep_gemm:
         # these numbers are from deepgemm kernel impl
         block_k = 64
         block_m = 64
         n_splits = compute_num_split(block_k, hc_hidden_size, cdiv(num_tokens, block_m))
+    elif use_tiled:
+        n_splits = prenorm_tiled.N_SPLITS
     else:
         n_splits = 1
 
@@ -198,6 +213,10 @@ def mhc_pre_tilelang(
             gemm_out_mul,
             gemm_out_sqrsum,
             n_splits,
+        )
+    elif use_tiled:
+        prenorm_tiled.hc_prenorm_gemm_tiled(
+            residual_2d, fn, gemm_out_mul, gemm_out_sqrsum
         )
     else:
         _tilelang_hc_prenorm_gemm(

@@ -89,6 +89,7 @@ from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
 
 from .attention import Glm5NextMLAAttention
 from .kda import Glm5NextLinearAttention
+from .ops import mla_fp8_decode
 from .multimodal import (
     Glm5NextMultiModalProcessor,
     Glm5NextProcessingInfo,
@@ -100,6 +101,10 @@ logger = init_logger(__name__)
 # GLM53_MHC_FUSE_POST_PRE=0 runs hc_post and the next hc_pre as two kernels
 # instead of the inter-layer fused kernel (the SGLang line found fusion slower).
 _FUSE_MHC_POST_PRE = os.getenv("GLM53_MHC_FUSE_POST_PRE", "1") != "0"
+# GLM53_MLA_FP8_DECODE=1: keep the MLA projections' checkpoint FP8 block scales
+# while loading and give decode-sized batches weight-only FP8 (Marlin) copies
+# of fused_qkv_a / q_b / o_proj (ops/mla_fp8_decode.py). Off by default.
+_MLA_FP8_DECODE = os.getenv("GLM53_MLA_FP8_DECODE", "0") == "1"
 
 
 class Glm5NextMLP(nn.Module):
@@ -951,6 +956,8 @@ class Glm5NextModel(nn.Module):
                     )
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
+        if _MLA_FP8_DECODE:
+            mla_fp8_decode.install(self)
         return loaded_params
 
 
@@ -1265,6 +1272,8 @@ def _try_load_fp8_attn_proj(
 
     weight_fp8, scale_inv = entry["weight"], entry["scale"]
     buf[layer_prefix].pop(key, None)
+    if _MLA_FP8_DECODE:
+        mla_fp8_decode.stash_scale(layer_prefix, key, scale_inv)
     block_size = weight_fp8.shape[1] // scale_inv.shape[1]
     weight_bf16 = _dequant_fp8_block(weight_fp8, scale_inv, block_size)
     # NoPE: pad kv_a rope portion (kv_lora_rank -> kv_lora_rank + qk_rope_head_dim).

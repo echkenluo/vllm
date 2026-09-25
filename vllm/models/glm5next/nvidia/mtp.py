@@ -30,10 +30,12 @@ from .model import (
     Glm5NextDecoderLayer,
     Glm5NextMLAAttention,
     Glm5NextMoE,
+    _MLA_FP8_DECODE,
     _try_load_fp8_attn_proj,
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
+from .ops import mla_fp8_decode
 from .ops.fp8_weight_only import Fp8LMHeadProxy, Fp8MarlinWeight
 from .ops.fused_eh_norm import fused_eh_norm
 
@@ -459,4 +461,6 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                     f"MTP speculative decoding layer {layer_idx} weights "
                     f"missing from checkpoint."
                 )
+        if _MLA_FP8_DECODE:
+            mla_fp8_decode.install(self)
         return loaded_params
