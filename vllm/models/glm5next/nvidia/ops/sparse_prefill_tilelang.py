@@ -14,7 +14,10 @@ on a BF16 cache. This is that kernel with two changes:
   values) and dequantized to BF16 while loading, so there is no BF16 copy of
   the cache and each key reads 528 bytes instead of 1024;
 * keys are masked by the per-token valid count (the converted top-k list is a
-  packed prefix), and padding indices are clamped to row 0 before the load.
+  packed prefix), padding indices are clamped to row 0 before the load, and
+  the loop stops after the last block that holds a valid key (the FlashInfer
+  kernel's cost also scales with the valid count; prefill rows before position
+  2048 have fewer than 2048 keys).
 
 One pipeline stage: two stages need 160 KB of shared memory, SM89 has ~100 KB.
 Rows whose valid count is 0 come out as 0, as in the FlashInfer path.
@@ -36,7 +39,6 @@ def _kernel(num_heads: int, topk: int, sm_scale: float, block_i: int = 64, threa
     sm_scale_log2 = sm_scale * 1.44269504  # exp2 instead of exp
     assert topk % block_i == 0
     padded_h = max(tilelang.math.next_power_of_2(num_heads), 16)
-    ni = topk // block_i
     seq_len = T.symbolic("seq_len")
     num_rows = T.symbolic("num_rows")
     bf16, fp8, f32 = "bfloat16", "float8_e4m3fn", "float32"
@@ -77,7 +79,7 @@ def _kernel(num_heads: int, topk: int, sm_scale: float, block_i: int = 64, threa
                 valid = Lens[bx]
                 T.copy(Q[bx, 0:padded_h, :], Q_shared)
 
-                for i_i in T.Pipelined(ni, num_stages=1):
+                for i_i in T.Pipelined(T.ceildiv(valid, block_i), num_stages=1):
                     for bi_i in T.Parallel(block_i):
                         mask[bi_i] = i_i * block_i + bi_i < valid
                     for bi_i, d_i in T.Parallel(block_i, D_NOPE):
