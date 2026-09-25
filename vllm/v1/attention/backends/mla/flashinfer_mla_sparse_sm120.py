@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """SM120 implementation variant for ``FLASHINFER_MLA_SPARSE_SM120``."""
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -16,6 +17,13 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
+
+# GLM53_SPARSE_PREFILL_TILELANG=1: batches of at least MIN_TOKENS query tokens
+# (prefill chunks) run GLM's NoPE sparse MLA through a TileLang kernel that
+# reads the FP8 cache directly (models/glm5next/nvidia/ops/
+# sparse_prefill_tilelang.py) instead of FlashInfer's per-token decode kernel.
+# Decode batches are unchanged. Off by default.
+_SPARSE_PREFILL_TILELANG = os.getenv("GLM53_SPARSE_PREFILL_TILELANG", "0") == "1"
 
 
 def _kv_scale_format_for_model(
@@ -171,4 +179,50 @@ class FlashInferMLASparseSM120Impl(FlashInferMLASparseImpl):
         # no separate per-tensor query/KV scale is part of this kernel contract.
         self.bmm1_scale = self.scale
         self.bmm2_scale = 1.0
+        if (
+            _SPARSE_PREFILL_TILELANG
+            and self.kv_scale_format == "arbitrary_fp32_nope"
+            and self.dcp_world_size == 1
+            and not self.need_to_return_lse_for_decode
+        ):
+            from vllm.models.glm5next.nvidia.ops import sparse_prefill_tilelang
+
+            q_cat = torch.cat(q, dim=-1) if isinstance(q, tuple) else q
+            if q_cat.shape[0] >= sparse_prefill_tilelang.MIN_TOKENS:
+                return self._forward_prefill_tilelang(
+                    q_cat, kv_c_and_k_pe_cache, attn_metadata
+                ), None
         return super().forward_mqa(q, kv_c_and_k_pe_cache, attn_metadata, layer)
+
+    def _forward_prefill_tilelang(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: FlashInferMLASparseMetadata,
+    ) -> torch.Tensor:
+        from vllm.models.glm5next.nvidia.ops.sparse_prefill_tilelang import (
+            sparse_prefill_fp8_nope,
+        )
+        from vllm.v1.attention.backends.mla.sparse_utils import (
+            flat_kv_row_view,
+            triton_convert_req_index_to_global_index,
+        )
+
+        num_tokens = q.shape[0]
+        assert self.topk_indices_buffer is not None
+        topk_indices = self.topk_indices_buffer[:num_tokens]
+        rows, block_stride_rows = flat_kv_row_view(
+            kv_c_and_k_pe_cache, attn_metadata.block_size
+        )
+        # Same conversion as the FlashInfer path: flat physical rows as a packed
+        # valid prefix (-1 after it) and the valid count per query token.
+        indices, lens = triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token[:num_tokens],
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            BLOCK_STRIDE_ROWS=block_stride_rows,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            return_valid_counts=True,
+        )
+        return sparse_prefill_fp8_nope(q, rows, indices, lens, self.scale)
