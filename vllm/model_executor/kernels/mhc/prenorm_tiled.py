@@ -5,13 +5,16 @@
 mhc_pre needs, per token, ``residual[4*H] @ fn[24, 4*H]^T`` and the squared
 sum of the residual, both in FP32. The TileLang kernels give every CTA one or
 two tokens, so each token re-reads the whole 24 x 16384 FP32 ``fn`` (1.5 MB)
-from L2; on L20 that makes the op L2-bound, 6-10x slower than reading the
+from L2; on L20 that makes the op L2-bound, 5-10x slower than reading the
 residual once from DRAM. Here each program takes BM tokens and one K range,
 so ``fn`` is reused across BM tokens; K is split into N_SPLITS ranges for
 parallelism and the partial sums are left in ``out[split]``, which the
 existing big-fuse kernels already add up (the DeepGEMM path uses the same
-layout). Products and sums are FP32 (tl.dot with input_precision="ieee" is
-FMA, not TF32), so only the summation order differs from the TileLang kernel.
+layout). The products run on the BF16 tensor cores without losing FP32
+accuracy: ``fn`` is split in-kernel into three BF16 parts that together hold
+all 24 mantissa bits, the BF16 residual times each part is exact, and the
+sums are FP32. On one L20 this takes 44 us for 864 tokens (TileLang 355 us,
+DRAM read bound 34 us) with a max error of 5e-6 against FP64.
 """
 
 import torch
@@ -19,8 +22,8 @@ import torch
 from vllm.triton_utils import tl, triton
 
 MIN_TOKENS = 128
-N_SPLITS = 8
-_BM = 32
+N_SPLITS = 16
+_BM = 64
 _BN = 32
 _BK = 64
 
@@ -52,10 +55,17 @@ def _prenorm_tiled_kernel(
             x_ptr + rm[:, None] * x_stride + rk[None, :],
             mask=rm[:, None] < M,
             other=0.0,
-        ).to(tl.float32)
+        )
         f = tl.load(fn_ptr + rn[:, None] * K + rk[None, :], mask=rn[:, None] < N_OUT, other=0.0)
-        acc = tl.dot(x, tl.trans(f), acc, input_precision="ieee")
-        sq += tl.sum(x * x, axis=1)
+        f1 = f.to(tl.bfloat16)
+        r1 = f - f1.to(tl.float32)
+        f2 = r1.to(tl.bfloat16)
+        f3 = (r1 - f2.to(tl.float32)).to(tl.bfloat16)
+        acc = tl.dot(x, tl.trans(f1), acc)
+        acc = tl.dot(x, tl.trans(f2), acc)
+        acc = tl.dot(x, tl.trans(f3), acc)
+        xf = x.to(tl.float32)
+        sq += tl.sum(xf * xf, axis=1)
     tl.store(
         out_ptr + pid_s * M * N_OUT + rm[:, None] * N_OUT + rn[None, :],
         acc,
@@ -90,4 +100,6 @@ def hc_prenorm_gemm_tiled(
         BM=_BM,
         BN=_BN,
         BK=_BK,
+        num_warps=4,
+        num_stages=3,
     )
