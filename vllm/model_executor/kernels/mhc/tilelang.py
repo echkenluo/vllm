@@ -10,8 +10,9 @@ from vllm.utils.torch_utils import direct_register_custom_op
 # GLM53_MHC_PRENORM_TILED=1: on the non-DeepGEMM path, batches of at least
 # prenorm_tiled.MIN_TOKENS tokens compute the mhc_pre FP32 pre-norm GEMM with
 # the token-tiled Triton kernel in prenorm_tiled.py (K split into partial sums
-# that the big-fuse kernel adds). Off by default; decode-sized batches are
-# unchanged either way.
+# that the big-fuse kernel adds), both in mhc_pre and in the fused post+pre op
+# that every layer after the first uses. Off by default; decode-sized batches
+# are unchanged either way.
 _PRENORM_TILED = os.getenv("GLM53_MHC_PRENORM_TILED", "0") == "1"
 
 
@@ -535,6 +536,9 @@ def mhc_fused_post_pre_tilelang(
 
     use_deep_gemm = is_deep_gemm_supported()
     use_small_fma = num_tokens <= 16
+    use_tiled = (
+        not use_deep_gemm and _PRENORM_TILED and num_tokens >= prenorm_tiled.MIN_TOKENS
+    )
     if use_small_fma:
         # TODO(gnovack): investigate autotuning these heuristics
         tile_n = 2 if num_tokens < 8 else 3
@@ -547,6 +551,8 @@ def mhc_fused_post_pre_tilelang(
             n_splits = compute_num_split(
                 block_k, hc_hidden_size, cdiv(num_tokens, block_m)
             )
+        elif use_tiled:
+            n_splits = prenorm_tiled.N_SPLITS
         else:
             n_splits = 1
 
@@ -620,6 +626,10 @@ def mhc_fused_post_pre_tilelang(
                 gemm_out_mul,
                 gemm_out_sqrsum,
                 n_splits,
+            )
+        elif use_tiled:
+            prenorm_tiled.hc_prenorm_gemm_tiled(
+                residual_cur_2d, fn, gemm_out_mul, gemm_out_sqrsum
             )
         else:
             _tilelang_hc_prenorm_gemm(
