@@ -13,8 +13,9 @@ the scale recovers the checkpoint's FP8 values exactly. That is checked bit
 for bit (the BF16 shard must come back from the FP8 copy unchanged) and a
 mismatch is an error. All batch sizes then run on the FP8 weights and the
 BF16 weights are freed (about 240 MB per GPU under TP8, which goes to the KV
-cache): on one L20, Marlin at prefill-sized batches costs about as much as
-cuBLAS BF16 for these shapes, while decode reads half the bytes.
+cache). Decode reads half the bytes; at prefill-sized batches (864 and 6912
+rows) Marlin is 2%-8% slower than cuBLAS BF16 per GEMM on one L20, about
+0.1% of a 6912-token prefill chunk.
 """
 
 import re
