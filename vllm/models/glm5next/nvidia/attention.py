@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -30,6 +32,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 from vllm.model_executor.utils import maybe_disable_graph_partition
+from vllm.models.glm5next.nvidia.ops import indexer_gate
 from vllm.models.glm5next.nvidia.ops.kpool_compress import fwht128_quant_fp8
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.glm5_next import Glm5NextConfig
@@ -37,6 +40,11 @@ from vllm.utils.deep_gemm import PAGED_MQA_PAGE_SIZES
 from vllm.v1.kv_cache_interface import KpoolTailSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
+
+# GLM53_INDEXER_GATE_SPLITK=1: compute the FP32 indexer head gate with a
+# split-K Triton kernel for decode-sized batches (same FP32 precision, only
+# the summation order differs; see ops/indexer_gate.py). Off by default.
+_GATE_SPLITK = os.getenv("GLM53_INDEXER_GATE_SPLITK", "0") == "1"
 
 # Shared torch.compile config for the indexer's small-kernel leaves. The MLA
 # indexer runs under breakable-CG (CompilationMode.NONE), which blocks FX-graph
@@ -330,7 +338,16 @@ class Indexer(nn.Module):
                 .contiguous()
                 .float()
             )
-        weights = torch.mm(hidden_states.float(), self._wp_fp32)
+            if _GATE_SPLITK:
+                # [n_head, hidden] FP32 copy for the split-K kernel; built
+                # together with _wp_fp32 on the first (eager, profile-run) call.
+                self._wp_fp32_nk = self._wp_fp32.t().contiguous()
+        if _GATE_SPLITK and 0 < hidden_states.shape[0] <= indexer_gate.MAX_ROWS:
+            weights = indexer_gate.indexer_gate_fp32(
+                hidden_states.contiguous(), self._wp_fp32_nk
+            )
+        else:
+            weights = torch.mm(hidden_states.float(), self._wp_fp32)
 
         k = _fused_indexer_k_norm(
             k, self.k_norm.weight, self.k_norm.bias, self.head_dim, self.k_norm.eps
