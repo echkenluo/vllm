@@ -16,6 +16,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -63,6 +64,7 @@ from vllm.models.deepseek_v4.nvidia.model import (
 from vllm.models.deepseek_v4.nvidia.model import (
     make_deepseek_v4_expert_params_mapping,
 )
+from vllm.models.deepseek_v4.nvidia.tp_comm import TPComm
 from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4_1.nvidia.ced import (
     CED_METADATA_KEY,
@@ -97,6 +99,7 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
         vllm_config: VllmConfig,
         prefix: str = "",
         use_sequence_parallel: bool = False,
+        defer_tp_reduce: bool = False,
     ):
         config = vllm_config.model_config.hf_config
         n_routed_experts = config.n_routed_experts
@@ -127,6 +130,7 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
             adapted_vllm_config,
             prefix=prefix,
             use_sequence_parallel=use_sequence_parallel,
+            defer_tp_reduce=defer_tp_reduce,
         )
         if self.experts.is_monolithic:
             raise NotImplementedError(
@@ -195,11 +199,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         candidate_block_buffer: torch.Tensor | None = None,
         engram_layout: EngramLayout | None = None,
+        tp_comm: TPComm | None = None,
     ):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
+        self.tp_comm = tp_comm
+        self.defer_tp_reduce = tp_comm is not None and tp_comm.enabled
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
         self.engram: Engram | None = None
@@ -223,12 +230,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             aux_stream_list=aux_stream_list,
             candidate_block_buffer=candidate_block_buffer,
         )
-        if self.use_sequence_parallel:
+        if self.use_sequence_parallel or self.defer_tp_reduce:
             self.attn.wo_b.reduce_results = False
         self.ffn = DeepseekV4MoE(
             vllm_config,
             prefix=f"{prefix}.ffn",
             use_sequence_parallel=self.use_sequence_parallel,
+            defer_tp_reduce=self.defer_tp_reduce,
         )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -294,6 +302,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         residual: torch.Tensor | None = None,
         engram_hashes: torch.Tensor | None = None,
         engram_mask: torch.Tensor | None = None,
+        comm_mode: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # The reference collapses each sublayer's input with the *previous*
         # sublayer's pre-mix: attention uses the pre-mix carried in (identity
@@ -344,6 +353,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     residual,
                     engram_hashes[:, self.engram.layer_hash_index],
                     engram_mask,
+                    sharded=comm_mode is not None,
                 )
             post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
                 residual,
@@ -362,10 +372,18 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
+        elif comm_mode is not None:
+            assert self.tp_comm is not None
+            x = self.tp_comm.gather(x, positions.shape[0], comm_mode, "attn")
 
         x = self.attn(positions, x, None)
         if self.use_sequence_parallel:
             x = sp_reduce_scatter(x)
+        elif comm_mode is not None:
+            assert self.tp_comm is not None
+            x = self.tp_comm.reduce(x, comm_mode, "attn")
+        elif self.defer_tp_reduce:
+            x = tensor_model_parallel_all_reduce(x)
 
         residual = mhc_post_tilelang(x, residual, post_mix, res_mix)
         post_mix, res_mix, x, ffn_pre = mhc_pre_delayed_tilelang(
@@ -382,7 +400,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             norm_weight=self.ffn_norm.weight,
             norm_eps=self.ffn_norm.variance_epsilon,
         )
+        if comm_mode is not None:
+            assert self.tp_comm is not None
+            x = self.tp_comm.gather(x, positions.shape[0], comm_mode, "moe")
         x = self.ffn(x, input_ids)
+        if comm_mode is not None:
+            assert self.tp_comm is not None
+            x = self.tp_comm.reduce(x, comm_mode, "moe")
+        elif self.defer_tp_reduce:
+            x = tensor_model_parallel_all_reduce(x)
         return x, residual, post_mix, res_mix, ffn_pre
 
 
@@ -395,9 +421,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.config = config
         self.quant_config = quant_config
         self.parallel_config = vllm_config.parallel_config
+        self.tp_comm = TPComm(vllm_config)
         self.use_mega_moe = vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         self.ced_enabled = bool(getattr(config, "ced_prefill", False))
+        if self.tp_comm.enabled and self.ced_enabled:
+            raise ValueError("DSV4_TP_COMM does not support CED prefill")
         self.ced_tail: CEDTailState | None = None
         if self.ced_enabled:
             validate_ced_config(vllm_config, self.use_sequence_parallel)
@@ -467,6 +496,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 aux_stream_list=aux_stream_list,
                 candidate_block_buffer=self.candidate_block_buffer,
                 engram_layout=self.engram_layout,
+                tp_comm=self.tp_comm,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -550,9 +580,22 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        full_num_tokens = positions.shape[0]
+        comm_mode = None
+        if self.tp_comm.enabled:
+            comm_mode = self.tp_comm.begin(
+                full_num_tokens,
+                self.layers[self.start_layer].attn.swa_cache_layer.prefix,
+            )
+        entry_sharded = False
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
+            elif comm_mode is not None:
+                hidden_states = self.tp_comm.embed(
+                    self.embed_tokens, input_ids, comm_mode
+                )
+                entry_sharded = True
             else:
                 hidden_states = self.embed_input_ids(input_ids)
         else:
@@ -614,7 +657,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                             engram_hashes[:, engram.layer_hash_index]
                         )
 
-        full_num_tokens = positions.shape[0]
+        if comm_mode is not None and not entry_sharded:
+            self.tp_comm.stats["embedding_replicated_shard"] += 1
+            hidden_states = sp_shard(hidden_states).contiguous()
         if self.use_sequence_parallel:
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 forward_context = get_forward_context()
@@ -656,6 +701,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 residual,
                 engram_hashes,
                 engram_mask,
+                comm_mode=comm_mode,
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
@@ -665,6 +711,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 aux_hidden_state = aux_recon.mean(dim=1)
                 if self.use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
+                elif comm_mode is not None:
+                    aux_hidden_state = self.tp_comm.gather(
+                        aux_hidden_state, full_num_tokens, comm_mode, "dspark_aux"
+                    )
                 aux_hidden_states.append(aux_hidden_state)
                 final_aux_recon = aux_recon
         if layer is not None:
@@ -687,6 +737,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.use_sequence_parallel:
                 hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
                 pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
+            elif comm_mode is not None:
+                hidden_states = self.tp_comm.gather(
+                    hidden_states, full_num_tokens, comm_mode, "mtp_hidden"
+                )
+                pre_mix = self.tp_comm.gather(
+                    pre_mix, full_num_tokens, comm_mode, "mtp_pre_mix"
+                )
             num_tokens = hidden_states.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
@@ -699,6 +756,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+        elif comm_mode is not None and self._mtp_hidden_buffer is None:
+            hidden_states = self.tp_comm.gather(
+                hidden_states, full_num_tokens, comm_mode, "head"
+            )
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states

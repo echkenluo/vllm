@@ -944,12 +944,13 @@ class Engram(nn.Module):
         """Gather this layer's rows on the main stream before decoder layers."""
         self.embed_tokens.lookup(hash_ids, self.staged_rows[: hash_ids.shape[0]])
 
-    def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
-        """Gather heads, returning only local tokens when SP is enabled."""
+    def embed(self, hash_ids: torch.Tensor, sharded: bool = False) -> torch.Tensor:
+        """Gather heads, returning only local tokens when SP is enabled or the
+        caller's residual is token-sharded (DSV4_TP_COMM prefill)."""
         rows = self.staged_rows[: hash_ids.shape[0]]
         if self.embed_tokens.tp_size == 1:
             return rows
-        if self.use_sequence_parallel:
+        if self.use_sequence_parallel or sharded:
             tp_size = self.embed_tokens.tp_size
             num_tokens, local_heads, dim = rows.shape
             gathered = tensor_model_parallel_all_gather(rows, dim=0)
@@ -974,14 +975,16 @@ class Engram(nn.Module):
         hidden_states: torch.Tensor,
         hash_ids: torch.Tensor,
         token_mask: torch.Tensor | None = None,
+        sharded: bool = False,
     ) -> torch.Tensor:
         """hidden_states: [T, hc_mult, dim]; hash_ids: [T, n_hash_cols] (all
         tokens, pre sequence-parallel shard); token_mask: [T], False shuts
-        the gate so those positions pass through untouched."""
-        kv = self.wkv(self.embed(hash_ids).flatten(-2))
+        the gate so those positions pass through untouched. `sharded` marks a
+        per-forward token shard with the same layout as sequence parallel."""
+        kv = self.wkv(self.embed(hash_ids, sharded).flatten(-2))
         num_kv_tokens = hash_ids.shape[0]
         assert token_mask is None or token_mask.shape == (num_kv_tokens,)
-        if self.use_sequence_parallel:
+        if self.use_sequence_parallel or sharded:
             tp_size = get_tensor_model_parallel_world_size()
             tp_rank = get_tensor_model_parallel_rank()
             shard_size = (num_kv_tokens + tp_size - 1) // tp_size
