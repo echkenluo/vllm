@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -85,16 +86,25 @@ class TPComm:
             raise ValueError("Invalid DSV4_TP_COMM mode or token threshold")
         if self.enabled:
             pc = config.parallel_config
+            # EP at DP1/PCP1 without mega MoE keeps the MoE output a single TP
+            # all-reduce (no all2all kernels, no native sequence parallelism).
+            ep_ok = not pc.enable_expert_parallel or (
+                config.kernel_config.moe_backend not in MEGA_MOE_BACKENDS
+                and pc.prefill_context_parallel_size == 1
+            )
             if not (
                 pc.tensor_parallel_size > 1
                 and pc.pipeline_parallel_size == 1
                 and pc.data_parallel_size == 1
-                and not pc.enable_expert_parallel
+                and ep_ok
                 and not pc.enable_dbo
                 and config.model_config.dtype == torch.bfloat16
                 and config.model_config.hf_config.hidden_size % GROUP == 0
             ):
-                raise ValueError("DSV4_TP_COMM requires BF16 TP-only PP1/DP1, no DBO")
+                raise ValueError(
+                    "DSV4_TP_COMM requires BF16 TP PP1/DP1, EP only without "
+                    "mega MoE, no DBO"
+                )
 
     def begin(self, rows: int, metadata_key: str) -> str | None:
         if not self.enabled:
