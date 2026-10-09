@@ -425,8 +425,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.use_mega_moe = vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         self.ced_enabled = bool(getattr(config, "ced_prefill", False))
-        if self.tp_comm.enabled and self.ced_enabled:
-            raise ValueError("DSV4_TP_COMM does not support CED prefill")
         self.ced_tail: CEDTailState | None = None
         if self.ced_enabled:
             validate_ced_config(vllm_config, self.use_sequence_parallel)
@@ -688,6 +686,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if idx == 20 and ced_step is not None:
                 boundary = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
                 assert pre_mix is not None
+                if comm_mode is not None:
+                    # CED builds layer 20's global KV over every row and
+                    # replays the request tails, so collect the
+                    # token-scattered rows (BF16, exact). Layers 20-39 run
+                    # on at most the replay window per request and keep
+                    # the replicated all-reduce path.
+                    boundary = self.tp_comm.gather(
+                        boundary, full_num_tokens, comm_mode, "ced_boundary"
+                    )
+                    pre_mix = self.tp_comm.gather(
+                        pre_mix, full_num_tokens, comm_mode, "ced_pre_mix"
+                    )
                 return self._forward_ced_decoder(
                     ced_step, boundary, pre_mix, input_ids, positions
                 )
