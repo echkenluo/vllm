@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import os
 from typing import Any
 
 from transformers import TokenizersBackend
@@ -10,6 +11,7 @@ from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
 from .deepseek_v4_encoding import encode_messages
 from .hf import HfTokenizer, get_cached_tokenizer
 from .protocol import TokenizerLike
+from .segment_token_cache import DSV4_SEGMENT_MARKERS, build_segment_token_cache
 
 
 def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
@@ -19,6 +21,14 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
     dsv4_tokenizer = copy.copy(tokenizer)
 
     added_vocab = tokenizer.get_added_vocab()
+
+    # Agent clients re-send the whole conversation every turn; with
+    # DSV4_SEGMENT_TOKEN_CACHE=1 only the text this process has not seen
+    # before is tokenized (see segment_token_cache.py). Built on first use.
+    segment_cache: dict[str, Any] = {
+        "enabled": os.getenv("DSV4_SEGMENT_TOKEN_CACHE", "0") == "1",
+        "cache": None,
+    }
 
     class _DeepseekV4Tokenizer(tokenizer.__class__):  # type: ignore
         def apply_chat_template(
@@ -65,6 +75,16 @@ def get_deepseek_v4_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 tokenizer_kwargs = {
                     k: kwargs[k] for k in ("truncation", "max_length") if k in kwargs
                 }
+                if segment_cache["enabled"] and not tokenizer_kwargs:
+                    if segment_cache["cache"] is None:
+                        segment_cache["cache"] = build_segment_token_cache(
+                            self,
+                            DSV4_SEGMENT_MARKERS,
+                            int(os.getenv("DSV4_SEGMENT_TOKEN_CACHE_MB", "64")) << 20,
+                        )
+                        segment_cache["enabled"] = segment_cache["cache"] is not None
+                    if segment_cache["enabled"]:
+                        return segment_cache["cache"].encode(prompt_str)
                 return self.encode(
                     prompt_str,
                     add_special_tokens=False,
