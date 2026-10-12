@@ -103,18 +103,23 @@ def test_refuses_markers_the_tokenizer_would_not_split_on():
 
 def test_chat_template_uses_cache_only_when_enabled(monkeypatch):
     messages = [{"role": "user", "content": "hello"}]
+    # get_deepseek_v4_tokenizer returns a copy of the tokenizer it wraps, so
+    # encode calls are counted on the returned object.
     monkeypatch.delenv("DSV4_SEGMENT_TOKEN_CACHE", raising=False)
     plain = get_deepseek_v4_tokenizer(SplittingTokenizer())
     expected = plain.apply_chat_template(messages)
+    calls = plain.encode_calls
+    plain.apply_chat_template(messages)
+    # Without the switch every request is encoded again.
+    assert plain.encode_calls == calls + 1
 
     monkeypatch.setenv("DSV4_SEGMENT_TOKEN_CACHE", "1")
-    base = SplittingTokenizer()
-    cached = get_deepseek_v4_tokenizer(base)
+    cached = get_deepseek_v4_tokenizer(SplittingTokenizer())
     assert cached.apply_chat_template(messages) == expected
-    calls = base.encode_calls
+    calls = cached.encode_calls
     assert cached.apply_chat_template(messages) == expected
     # The second identical request encodes nothing new.
-    assert base.encode_calls == calls
+    assert cached.encode_calls == calls
     # Truncation still goes through the plain encode.
     cached.apply_chat_template(messages, truncation=True, max_length=8)
-    assert base.encode_calls == calls + 1
+    assert cached.encode_calls == calls + 1
