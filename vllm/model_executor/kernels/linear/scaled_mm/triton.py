@@ -163,6 +163,22 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             return False, "only CUDA-alike and XPU devices are supported."
         return True, None
 
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        super().process_weights_after_loading(layer)
+        # w8a8_triton_block_scaled_mm decodes E8M0 scales to fp32 on every call
+        # (Triton cannot bind E8M0 tensors); decode the weight scales once here
+        # so a decode step does not launch one extra kernel per GEMM.
+        e8m0 = getattr(torch, "float8_e8m0fnu", None)
+        if e8m0 is None or not current_platform.is_cuda():
+            return
+        params = self._get_layer_params(layer)
+        for name, scale in (
+            (params.WEIGHT_SCALE_INV, params.weight_scale_inv),
+            (params.WEIGHT_SCALE, params.weight_scale),
+        ):
+            if scale is not None and scale.dtype == e8m0:
+                replace_parameter(layer, name, scale.to(torch.float32).contiguous())
+
     def apply_block_scaled_mm(
         self,
         A: torch.Tensor,
