@@ -87,6 +87,16 @@ def wire():
     out["rs_tail_new_max_abs_err_vs_fp64"] = float((new.double() - exact).abs().max())
     out["rs_tail_old_mean_abs_err_vs_fp64"] = float((old.double() - exact).abs().mean())
     out["rs_tail_new_mean_abs_err_vs_fp64"] = float((new.double() - exact).abs().mean())
+    # the same tails before the BF16 cast (recorded, not a check): the fused kernel may contract value * scale and
+    # the add into one FMA, the reference rounds each product first, so they should differ by a few FP32 ulps at
+    # the summands' scale and the BF16 mismatches are results that sit near a rounding boundary
+    old32 = tc._unpack(received, HIDDEN, rows, torch.float32).view(WORLD, shard, HIDDEN).sum(dim=0)
+    new32 = tc._unpack_sum(received, HIDDEN, WORLD, torch.float32)
+    fp32_ulp_of_abs_sum = torch.exp2(torch.floor(torch.log2(abs_sum.clamp_min(1e-30))) - 23)
+    d32 = (old32.double() - new32.double()).abs() / fp32_ulp_of_abs_sum
+    out["rs_tail_fp32_max_diff_in_ulps_of_abs_sum"] = float(d32.max())
+    out["rs_tail_fp32_mean_diff_in_ulps_of_abs_sum"] = float(d32.mean())
+    out["rs_tail_fp32_mismatches"] = int((old32 != new32).sum())
     # timings, us per call, the shapes of one 4K prefill forward
     x512 = sample(512, 8)
     full = torch.cat([tc._pack(x512)] * WORLD)
