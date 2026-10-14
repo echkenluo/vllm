@@ -21,7 +21,13 @@ def _text_model(worker):
 
 
 class CommWorker:
-    def dsv4_comm_mode(self, mode: str = "", reset: str = "0", embedding_rs: str = ""):
+    def dsv4_comm_mode(
+        self,
+        mode: str = "",
+        reset: str = "0",
+        embedding_rs: str = "",
+        fused_wire: str = "",
+    ):
         model = _text_model(self)
         comm = model.tp_comm
         assert comm.enabled
@@ -36,11 +42,16 @@ class CommWorker:
             if embedding_rs not in ("0", "1"):
                 raise ValueError(embedding_rs)
             comm.embedding_rs = embedding_rs == "1"
+        if fused_wire:
+            if fused_wire not in ("0", "1"):
+                raise ValueError(fused_wire)
+            comm.fused_wire = fused_wire == "1"
         return {
             "rank": get_tp_group().rank_in_group,
             "mode": comm.mode,
             "min_tokens": comm.min_tokens,
             "embedding_rs": comm.embedding_rs,
+            "fused_wire": comm.fused_wire,
             "stats": dict(comm.stats),
             "aux_layers": list(getattr(model, "aux_hidden_state_layers", ())),
             "layers": model.end_layer - model.start_layer,

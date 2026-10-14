@@ -66,6 +66,131 @@ def _unpack(packed: torch.Tensor, hidden: int, rows: int, dtype) -> torch.Tensor
     return out
 
 
+# Fused wire (DSV4_TP_COMM_FUSED_WIRE=1): the same bytes on the wire with fewer
+# local passes. _pack and _unpack above stay as the reference path.
+@triton.jit
+def _pack_fused_kernel(
+    x,
+    q,
+    s,
+    x_stride,
+    stride: tl.constexpr,
+    H: tl.constexpr,
+    GROUP: tl.constexpr,
+    EPS: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    EXACT_DIV: tl.constexpr,
+):
+    # per_token_group_quant_fp8's arithmetic, written straight into the packed
+    # row: FP8 payload at [0, H), FP32 scales at byte H (float index H // 4).
+    row = tl.program_id(0)
+    group = tl.program_id(1)
+    col = group * GROUP + tl.arange(0, GROUP)
+    value = tl.load(x + row * x_stride + col).to(tl.float32)
+    absmax = tl.maximum(tl.max(tl.abs(value), axis=0), EPS)
+    if EXACT_DIV:
+        scale = tl.math.div_rn(absmax, FP8_MAX)
+        y = tl.math.div_rn(value, scale)
+    else:
+        scale = absmax / FP8_MAX
+        y = value / scale
+    y = tl.minimum(tl.maximum(y, -FP8_MAX), FP8_MAX)
+    tl.store(q + row * stride + col, y.to(q.dtype.element_ty))
+    tl.store(s + row * (stride // 4) + H // 4 + group, scale)
+
+
+@triton.jit
+def _unpack_fused_kernel(
+    q, s, out, stride: tl.constexpr, H: tl.constexpr, GROUP: tl.constexpr
+):
+    # _unpack_kernel reading the scales in place instead of from a copy
+    row = tl.program_id(0)
+    group = tl.program_id(1)
+    col = group * GROUP + tl.arange(0, GROUP)
+    value = tl.load(q + row * stride + col).to(tl.float32)
+    scale = tl.load(s + row * (stride // 4) + H // 4 + group)
+    tl.store(out + row * H + col, value * scale)
+
+
+@triton.jit
+def _unpack_sum_kernel(
+    q,
+    s,
+    out,
+    shard,
+    stride: tl.constexpr,
+    H: tl.constexpr,
+    GROUP: tl.constexpr,
+    WORLD: tl.constexpr,
+):
+    # FP8 ReduceScatter tail: dequantize the WORLD received copies of one row
+    # and sum them in FP32, without materializing the FP32 [rows, H] tensor
+    row = tl.program_id(0)
+    group = tl.program_id(1)
+    col = group * GROUP + tl.arange(0, GROUP)
+    acc = tl.zeros((GROUP,), dtype=tl.float32)
+    for w in tl.static_range(WORLD):
+        r = w * shard + row
+        value = tl.load(q + r * stride + col).to(tl.float32)
+        acc += value * tl.load(s + r * (stride // 4) + H // 4 + group)
+    tl.store(out + row * H + col, acc.to(out.dtype.element_ty))
+
+
+FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+# set from the unit check on L20 (vllm per_token_group_quant_8bit_kernel parity)
+_PACK_EXACT_DIV = True
+
+
+def _pack_fused(x: torch.Tensor) -> torch.Tensor:
+    x = x.contiguous()
+    rows, hidden = x.shape
+    packed = torch.empty(
+        (rows, hidden + hidden // GROUP * 4), dtype=torch.uint8, device=x.device
+    )
+    _pack_fused_kernel[(rows, hidden // GROUP)](
+        x,
+        packed.view(torch.float8_e4m3fn),
+        packed.view(torch.float32),
+        x.stride(0),
+        packed.stride(0),
+        hidden,
+        GROUP,
+        1e-10,
+        FP8_MAX,
+        _PACK_EXACT_DIV,
+    )
+    return packed
+
+
+def _unpack_fused(packed: torch.Tensor, hidden: int, rows: int, dtype):
+    out = torch.empty((rows, hidden), dtype=dtype, device=packed.device)
+    _unpack_fused_kernel[(rows, hidden // GROUP)](
+        packed.view(torch.float8_e4m3fn),
+        packed.view(torch.float32),
+        out,
+        packed.stride(0),
+        hidden,
+        GROUP,
+    )
+    return out
+
+
+def _unpack_sum(packed: torch.Tensor, hidden: int, world: int, dtype):
+    shard = packed.shape[0] // world
+    out = torch.empty((shard, hidden), dtype=dtype, device=packed.device)
+    _unpack_sum_kernel[(shard, hidden // GROUP)](
+        packed.view(torch.float8_e4m3fn),
+        packed.view(torch.float32),
+        out,
+        shard,
+        packed.stride(0),
+        hidden,
+        GROUP,
+        world,
+    )
+    return out
+
+
 def _pad(x: torch.Tensor) -> torch.Tensor:
     padding = (-x.shape[0]) % get_tp_group().world_size
     if padding:
@@ -81,6 +206,7 @@ class TPComm:
         self.mode = os.getenv("DSV4_TP_COMM_MODE", "bf16")
         self.min_tokens = int(os.getenv("DSV4_TP_COMM_MIN_TOKENS", "512"))
         self.embedding_rs = os.getenv("DSV4_TP_COMM_EMBED_RS", "1") == "1"
+        self.fused_wire = os.getenv("DSV4_TP_COMM_FUSED_WIRE", "1") == "1"
         self.stats: Counter[str] = Counter()
         if self.mode not in MODES or self.min_tokens < 1:
             raise ValueError("Invalid DSV4_TP_COMM mode or token threshold")
@@ -150,11 +276,13 @@ class TPComm:
         fp8 = site in ("attn", "moe") and mode in ("fp8_ag", "fp8_both")
         self.stats[("fp8_ag_" if fp8 else "bf16_ag_") + site] += 1
         if fp8:
-            packed = _pack(x)
+            packed = _pack_fused(x) if self.fused_wire else _pack(x)
             full = torch.empty(
                 (total, packed.shape[1]), dtype=torch.uint8, device=x.device
             )
             dist.all_gather_into_tensor(full, packed, group=group.device_group)
+            if self.fused_wire:
+                return _unpack_fused(full, x.shape[-1], rows, x.dtype)
             return _unpack(full, x.shape[-1], rows, x.dtype)
         return group.all_gather(x.contiguous(), dim=0)[:rows]
 
@@ -166,10 +294,12 @@ class TPComm:
         x = _pad(x)
         if mode not in ("fp8_rs", "fp8_both"):
             return group.reduce_scatter(x, dim=0)
-        packed = _pack(x)
+        packed = _pack_fused(x) if self.fused_wire else _pack(x)
         received = torch.empty_like(packed)
         dist.all_to_all_single(received, packed, group=group.device_group)
         rows, hidden = x.shape
+        if self.fused_wire:
+            return _unpack_sum(received, hidden, group.world_size, x.dtype)
         values = _unpack(received, hidden, rows, torch.float32)
         return (
             values.view(group.world_size, rows // group.world_size, hidden)
