@@ -9,6 +9,7 @@ up before timing. All workers acknowledge the mode before requests resume.
 
 import torch
 
+import vllm.model_executor.kernels.mhc.tilelang as mhc_tilelang
 from vllm.distributed import get_tp_group
 from vllm.models.common.ops.sequence_parallel import sp_shard
 from vllm.models.deepseek_v4.nvidia.tp_comm import GROUP, MODES, _pack, _unpack
@@ -27,6 +28,7 @@ class CommWorker:
         reset: str = "0",
         embedding_rs: str = "",
         fused_wire: str = "",
+        prenorm_tiled: str = "",
     ):
         model = _text_model(self)
         comm = model.tp_comm
@@ -46,12 +48,18 @@ class CommWorker:
             if fused_wire not in ("0", "1"):
                 raise ValueError(fused_wire)
             comm.fused_wire = fused_wire == "1"
+        if prenorm_tiled:
+            if prenorm_tiled not in ("0", "1"):
+                raise ValueError(prenorm_tiled)
+            # read at call time by mhc_pre_tilelang and mhc_fused_post_pre_tilelang
+            mhc_tilelang._PRENORM_TILED = prenorm_tiled == "1"
         return {
             "rank": get_tp_group().rank_in_group,
             "mode": comm.mode,
             "min_tokens": comm.min_tokens,
             "embedding_rs": comm.embedding_rs,
             "fused_wire": comm.fused_wire,
+            "prenorm_tiled": mhc_tilelang._PRENORM_TILED,
             "stats": dict(comm.stats),
             "aux_layers": list(getattr(model, "aux_hidden_state_layers", ())),
             "layers": model.end_layer - model.start_layer,

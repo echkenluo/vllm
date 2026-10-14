@@ -137,8 +137,9 @@ def _unpack_sum_kernel(
 
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
-# set from the unit check on L20 (vllm per_token_group_quant_8bit_kernel parity)
-_PACK_EXACT_DIV = True
+# IEEE division as in per_token_group_quant_8bit_kernel (_C is not built with
+# --use_fast_math); check_dsv4_tp_comm_fused_wire.py checks the byte parity
+_PACK_EXACT_DIV = os.getenv("DSV4_TP_COMM_PACK_EXACT_DIV", "1") == "1"
 
 
 def _pack_fused(x: torch.Tensor) -> torch.Tensor:
@@ -163,6 +164,7 @@ def _pack_fused(x: torch.Tensor) -> torch.Tensor:
 
 
 def _unpack_fused(packed: torch.Tensor, hidden: int, rows: int, dtype):
+    assert packed.shape[1] == hidden + hidden // GROUP * 4
     out = torch.empty((rows, hidden), dtype=dtype, device=packed.device)
     _unpack_fused_kernel[(rows, hidden // GROUP)](
         packed.view(torch.float8_e4m3fn),
@@ -176,6 +178,8 @@ def _unpack_fused(packed: torch.Tensor, hidden: int, rows: int, dtype):
 
 
 def _unpack_sum(packed: torch.Tensor, hidden: int, world: int, dtype):
+    assert packed.shape[1] == hidden + hidden // GROUP * 4
+    assert packed.shape[0] % world == 0
     shard = packed.shape[0] // world
     out = torch.empty((shard, hidden), dtype=dtype, device=packed.device)
     _unpack_sum_kernel[(shard, hidden // GROUP)](
