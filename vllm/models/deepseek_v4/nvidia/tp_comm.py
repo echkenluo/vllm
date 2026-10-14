@@ -66,9 +66,9 @@ def _unpack(packed: torch.Tensor, hidden: int, rows: int, dtype) -> torch.Tensor
     return out
 
 
-# Fused wire (DSV4_TP_COMM_FUSED_WIRE=1, off by default): the same bytes on the wire (packing is
-# unchanged) with fewer local passes after the collectives. _unpack above stays
-# as the reference path.
+# Fused wire (DSV4_TP_COMM_FUSED_WIRE=1, off by default): the same bytes on the
+# wire (packing is unchanged) with fewer local passes after the collectives.
+# _unpack above stays as the reference path.
 @triton.jit
 def _unpack_fused_kernel(
     q, s, out, stride: tl.constexpr, H: tl.constexpr, GROUP: tl.constexpr
