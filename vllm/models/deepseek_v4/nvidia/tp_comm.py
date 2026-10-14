@@ -66,7 +66,7 @@ def _unpack(packed: torch.Tensor, hidden: int, rows: int, dtype) -> torch.Tensor
     return out
 
 
-# Fused wire (DSV4_TP_COMM_FUSED_WIRE=1): the same bytes on the wire (packing is
+# Fused wire (DSV4_TP_COMM_FUSED_WIRE=1, off by default): the same bytes on the wire (packing is
 # unchanged) with fewer local passes after the collectives. _unpack above stays
 # as the reference path.
 @triton.jit
@@ -153,7 +153,7 @@ class TPComm:
         self.mode = os.getenv("DSV4_TP_COMM_MODE", "bf16")
         self.min_tokens = int(os.getenv("DSV4_TP_COMM_MIN_TOKENS", "512"))
         self.embedding_rs = os.getenv("DSV4_TP_COMM_EMBED_RS", "1") == "1"
-        self.fused_wire = os.getenv("DSV4_TP_COMM_FUSED_WIRE", "1") == "1"
+        self.fused_wire = os.getenv("DSV4_TP_COMM_FUSED_WIRE", "0") == "1"
         self.stats: Counter[str] = Counter()
         if self.mode not in MODES or self.min_tokens < 1:
             raise ValueError("Invalid DSV4_TP_COMM mode or token threshold")
