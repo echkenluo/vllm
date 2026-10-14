@@ -5,9 +5,11 @@
 Run inside the vLLM image with this branch mounted; no distributed init. Writes one JSON object to --output and
 exits 1 when a check fails (thresholds of amendment 1 of the 2026-10-14 comm gain gap round):
 
-  wire     _pack_fused against _pack (bytes, both division modes), _unpack_fused against _unpack
-           (bits), and _unpack_sum against the reference tail (unpack to FP32, sum over ranks, cast),
-           both compared to an FP64 sum of the dequantized values; plus CUDA-event timings.
+  wire     _unpack_fused against _unpack (bits), and _unpack_sum against the reference tail (unpack to
+           FP32, sum over ranks, cast), both compared to an FP64 sum of the dequantized values; the
+           difference is measured in BF16 ulps at the scale of the summands (sum of |v_w|), because the
+           eight partial sums often cancel and an ulp of the result itself is then meaningless; plus
+           CUDA-event timings.
   prenorm  hc_prenorm_gemm_tiled (GLM53_MHC_PRENORM_TILED) against the TileLang kernel the DSv4 path
            uses today, at the DSv4 shape (24 x 16384) for 512 and 4096 rows, both against FP64.
 
@@ -63,38 +65,31 @@ def sample(rows, seed):
 def wire():
     out = {}
     for rows in (511, 512, 4096):
-        x = sample(rows, rows)
-        ref = tc._pack(x)
-        for exact in (True, False):
-            tc._PACK_EXACT_DIV = exact
-            got = tc._pack_fused(x)
-            out[f"pack_rows{rows}_exact{int(exact)}_mismatched_bytes"] = int((got != ref).sum())
+        ref = tc._pack(sample(rows, rows))
         out[f"unpack_rows{rows}_bitwise_equal"] = bool(
             torch.equal(tc._unpack(ref, HIDDEN, rows, torch.bfloat16),
                         tc._unpack_fused(ref, HIDDEN, rows, torch.bfloat16)))
-    tc._PACK_EXACT_DIV = True
     # ReduceScatter tail at 4096 rows: rank w sent its shard-th partial rows to us, row block w of received
     rows, shard = 4096, 4096 // WORLD
     received = torch.cat([tc._pack(sample(shard, 1000 + w)) for w in range(WORLD)])
     old = (tc._unpack(received, HIDDEN, rows, torch.float32).view(WORLD, shard, HIDDEN).sum(dim=0)
            .to(torch.bfloat16))
     new = tc._unpack_sum(received, HIDDEN, WORLD, torch.bfloat16)
-    exact = (tc._unpack(received, HIDDEN, rows, torch.float32).double().view(WORLD, shard, HIDDEN).sum(0))
-    ulp = ulp_distance(old, new)
+    values = tc._unpack(received, HIDDEN, rows, torch.float32).double().view(WORLD, shard, HIDDEN)
+    exact = values.sum(0)
+    abs_sum = values.abs().sum(0)
+    ulp_of_abs_sum = torch.exp2(torch.floor(torch.log2(abs_sum.clamp_min(1e-30))) - 7)  # BF16: 8 significant bits
     out["rs_tail_bf16_mismatches"] = int((old != new).sum())
     out["rs_tail_elements"] = old.numel()
-    out["rs_tail_max_ulp"] = int(ulp.max())
+    out["rs_tail_max_ulp_of_result"] = int(ulp_distance(old, new).max())  # blows up where the sum cancels
+    out["rs_tail_max_diff_in_ulps_of_abs_sum"] = float(((old.double() - new.double()).abs() / ulp_of_abs_sum).max())
     out["rs_tail_old_max_abs_err_vs_fp64"] = float((old.double() - exact).abs().max())
     out["rs_tail_new_max_abs_err_vs_fp64"] = float((new.double() - exact).abs().max())
     out["rs_tail_old_mean_abs_err_vs_fp64"] = float((old.double() - exact).abs().mean())
     out["rs_tail_new_mean_abs_err_vs_fp64"] = float((new.double() - exact).abs().mean())
     # timings, us per call, the shapes of one 4K prefill forward
-    x4k, x512 = sample(4096, 7), sample(512, 8)
+    x512 = sample(512, 8)
     full = torch.cat([tc._pack(x512)] * WORLD)
-    out["us_pack_4096_old"] = bench(lambda: tc._pack(x4k))
-    out["us_pack_4096_new"] = bench(lambda: tc._pack_fused(x4k))
-    out["us_pack_512_old"] = bench(lambda: tc._pack(x512))
-    out["us_pack_512_new"] = bench(lambda: tc._pack_fused(x512))
     out["us_ag_unpack_4096_old"] = bench(lambda: tc._unpack(full, HIDDEN, 4096, torch.bfloat16))
     out["us_ag_unpack_4096_new"] = bench(lambda: tc._unpack_fused(full, HIDDEN, 4096, torch.bfloat16))
     out["us_rs_tail_old"] = bench(lambda: tc._unpack(received, HIDDEN, rows, torch.float32)
@@ -134,12 +129,11 @@ def prenorm():
 
 def failures(w, p):
     bad = []
-    if not all(w[f"pack_rows{r}_exact1_mismatched_bytes"] == 0 for r in (511, 512, 4096)):
-        bad.append("fused pack with IEEE division differs from _pack")
     if not all(w[f"unpack_rows{r}_bitwise_equal"] for r in (511, 512, 4096)):
         bad.append("fused AllGather dequantize differs from _unpack")
-    if w["rs_tail_max_ulp"] > 1 or w["rs_tail_bf16_mismatches"] > 0.01 * w["rs_tail_elements"]:
-        bad.append("fused ReduceScatter tail differs from the reference by more than 1 ulp or 1% of elements")
+    if w["rs_tail_max_diff_in_ulps_of_abs_sum"] > 1.0 or w["rs_tail_bf16_mismatches"] > 0.01 * w["rs_tail_elements"]:
+        bad.append("fused ReduceScatter tail differs from the reference by more than 1 ulp at the summands' scale "
+                   "or in more than 1% of elements")
     if w["rs_tail_new_mean_abs_err_vs_fp64"] > 1.1 * w["rs_tail_old_mean_abs_err_vs_fp64"]:
         bad.append("fused ReduceScatter tail is less accurate than the reference")
     for r in (512, 4096):

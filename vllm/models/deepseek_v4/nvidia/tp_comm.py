@@ -66,39 +66,9 @@ def _unpack(packed: torch.Tensor, hidden: int, rows: int, dtype) -> torch.Tensor
     return out
 
 
-# Fused wire (DSV4_TP_COMM_FUSED_WIRE=1): the same bytes on the wire with fewer
-# local passes. _pack and _unpack above stay as the reference path.
-@triton.jit
-def _pack_fused_kernel(
-    x,
-    q,
-    s,
-    x_stride,
-    stride: tl.constexpr,
-    H: tl.constexpr,
-    GROUP: tl.constexpr,
-    EPS: tl.constexpr,
-    FP8_MAX: tl.constexpr,
-    EXACT_DIV: tl.constexpr,
-):
-    # per_token_group_quant_fp8's arithmetic, written straight into the packed
-    # row: FP8 payload at [0, H), FP32 scales at byte H (float index H // 4).
-    row = tl.program_id(0)
-    group = tl.program_id(1)
-    col = group * GROUP + tl.arange(0, GROUP)
-    value = tl.load(x + row * x_stride + col).to(tl.float32)
-    absmax = tl.maximum(tl.max(tl.abs(value), axis=0), EPS)
-    if EXACT_DIV:
-        scale = tl.math.div_rn(absmax, FP8_MAX)
-        y = tl.math.div_rn(value, scale)
-    else:
-        scale = absmax / FP8_MAX
-        y = value / scale
-    y = tl.minimum(tl.maximum(y, -FP8_MAX), FP8_MAX)
-    tl.store(q + row * stride + col, y.to(q.dtype.element_ty))
-    tl.store(s + row * (stride // 4) + H // 4 + group, scale)
-
-
+# Fused wire (DSV4_TP_COMM_FUSED_WIRE=1): the same bytes on the wire (packing is
+# unchanged) with fewer local passes after the collectives. _unpack above stays
+# as the reference path.
 @triton.jit
 def _unpack_fused_kernel(
     q, s, out, stride: tl.constexpr, H: tl.constexpr, GROUP: tl.constexpr
@@ -134,33 +104,6 @@ def _unpack_sum_kernel(
         value = tl.load(q + r * stride + col).to(tl.float32)
         acc += value * tl.load(s + r * (stride // 4) + H // 4 + group)
     tl.store(out + row * H + col, acc.to(out.dtype.element_ty))
-
-
-FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
-# IEEE division as in per_token_group_quant_8bit_kernel (_C is not built with
-# --use_fast_math); check_dsv4_tp_comm_fused_wire.py checks the byte parity
-_PACK_EXACT_DIV = os.getenv("DSV4_TP_COMM_PACK_EXACT_DIV", "1") == "1"
-
-
-def _pack_fused(x: torch.Tensor) -> torch.Tensor:
-    x = x.contiguous()
-    rows, hidden = x.shape
-    packed = torch.empty(
-        (rows, hidden + hidden // GROUP * 4), dtype=torch.uint8, device=x.device
-    )
-    _pack_fused_kernel[(rows, hidden // GROUP)](
-        x,
-        packed.view(torch.float8_e4m3fn),
-        packed.view(torch.float32),
-        x.stride(0),
-        packed.stride(0),
-        hidden,
-        GROUP,
-        1e-10,
-        FP8_MAX,
-        _PACK_EXACT_DIV,
-    )
-    return packed
 
 
 def _unpack_fused(packed: torch.Tensor, hidden: int, rows: int, dtype):
@@ -280,7 +223,7 @@ class TPComm:
         fp8 = site in ("attn", "moe") and mode in ("fp8_ag", "fp8_both")
         self.stats[("fp8_ag_" if fp8 else "bf16_ag_") + site] += 1
         if fp8:
-            packed = _pack_fused(x) if self.fused_wire else _pack(x)
+            packed = _pack(x)
             full = torch.empty(
                 (total, packed.shape[1]), dtype=torch.uint8, device=x.device
             )
@@ -298,7 +241,7 @@ class TPComm:
         x = _pad(x)
         if mode not in ("fp8_rs", "fp8_both"):
             return group.reduce_scatter(x, dim=0)
-        packed = _pack_fused(x) if self.fused_wire else _pack(x)
+        packed = _pack(x)
         received = torch.empty_like(packed)
         dist.all_to_all_single(received, packed, group=group.device_group)
         rows, hidden = x.shape
