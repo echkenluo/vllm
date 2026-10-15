@@ -59,6 +59,62 @@ def test_sm89_fp8_einsum_triton_matches_reference() -> None:
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.parametrize("num_tokens", [1, 6, 24, 96])
+def test_sm89_fp8_einsum_split_k_matches_unsplit(num_tokens: int) -> None:
+    """Splitting the hidden loop only changes the order of FP32 additions: every
+    split must match the reference, stay within one BF16 rounding of the
+    unsplit kernel, and give the same bits on a second run (the splits are
+    added in a fixed order, not with atomics)."""
+    torch.manual_seed(1)
+    num_groups, hidden_size, out_rank = 1, 1024, 256
+    a = _to_fp8(torch.randn((num_tokens, num_groups, hidden_size), device="cuda"))
+    b = _to_fp8(torch.randn((num_groups, out_rank, hidden_size), device="cuda"))
+    a_scale = (
+        torch.rand((num_tokens, num_groups, hidden_size // 128), device="cuda") * 0.1
+        + 0.01
+    )
+    b_scale = (
+        torch.rand((num_groups, out_rank // 128, hidden_size // 128), device="cuda")
+        * 0.1
+        + 0.01
+    )
+    ref = torch.einsum(
+        "tgh,grh->tgr",
+        a.float() * a_scale.repeat_interleave(128, dim=2),
+        b.float()
+        * b_scale.repeat_interleave(128, dim=1).repeat_interleave(128, dim=2),
+    )
+    outs = {}
+    for split in (1, 2, 4, 8):
+        out = torch.empty(
+            (num_tokens, num_groups, out_rank), device="cuda", dtype=torch.bfloat16
+        )
+        fp8_einsum_module._deepseek_v4_sm89_fp8_einsum(
+            a, a_scale, b, b_scale, out, split_override=split
+        )
+        again = torch.empty_like(out)
+        fp8_einsum_module._deepseek_v4_sm89_fp8_einsum(
+            a, a_scale, b, b_scale, again, split_override=split
+        )
+        assert torch.equal(out, again), f"split={split} is not deterministic"
+        torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
+        outs[split] = out
+    for split in (2, 4, 8):
+        # one BF16 rounding step of the output, plus a floor for outputs that
+        # cancel to near zero, where the FP32 order matters more than BF16
+        torch.testing.assert_close(
+            outs[split].float(), outs[1].float(), rtol=2.0**-7, atol=1e-5
+        )
+
+
+def test_sm89_fp8_einsum_split_choice() -> None:
+    """Decode shapes of wo_a get a split; prefill shapes keep one pass."""
+    choose = fp8_einsum_module._choose_split
+    assert choose(8, 32) == 16  # up to 16 rows: 8 output tiles, 32 K blocks
+    assert choose(48, 32) == 2  # 96 rows: 6 x 8 tiles
+    assert choose(2048, 32) == 1  # 4096 rows
+
+
 def test_sm89_fp8_einsum_accepts_checkpoint_scale_layout(monkeypatch) -> None:
     monkeypatch.setattr(
         fp8_einsum_module.current_platform,

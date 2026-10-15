@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """SM89 Triton FP8 einsum kernels for DeepSeek V4."""
 
+import os
+
 import torch
 
 from vllm.distributed import get_tensor_model_parallel_rank
@@ -12,6 +14,16 @@ from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.deep_gemm import fp8_einsum
+
+# DSV4_WO_A_SPLITK=1 (off by default): split the hidden (K) loop across CTAs when
+# the token x output tiles alone cannot fill the GPU. wo_a in decode has 1024
+# output columns per rank, so at most 16 rows there are only 8 output tiles and
+# each CTA walks all 32 K blocks of 128 one after another; the call then costs
+# about 36 us on L20 for a 4 MB weight that streams in 5 us. With the split, the
+# partial sums go to an FP32 buffer and a second kernel adds the splits in a
+# fixed order, so the result does not depend on scheduling.
+_SPLITK = os.getenv("DSV4_WO_A_SPLITK", "0") == "1"
+_SPLITK_TARGET_CTAS = int(os.getenv("DSV4_WO_A_SPLITK_CTAS", "184"))
 
 
 @triton.jit(
@@ -28,6 +40,7 @@ def _deepseek_v4_sm89_fp8_einsum_kernel(
     b_ptr,
     b_scale_ptr,
     out_ptr,
+    partial_ptr,
     num_tokens,
     num_groups: tl.constexpr,
     out_rank: tl.constexpr,
@@ -50,19 +63,24 @@ def _deepseek_v4_sm89_fp8_einsum_kernel(
     BLOCK_TOKENS: tl.constexpr,
     BLOCK_OUT: tl.constexpr,
     BLOCK_HIDDEN: tl.constexpr,
+    SPLIT: tl.constexpr,
 ) -> None:
     a_stride_group = tl.multiple_of(a_stride_group, 16)
     a_scale_stride_group = tl.multiple_of(a_scale_stride_group, 16)
     token_block = tl.program_id(0)
     out_block = tl.program_id(1)
-    group = tl.program_id(2)
+    group = tl.program_id(2) // SPLIT
+    split = tl.program_id(2) % SPLIT
+    hidden_per_split = hidden_size // SPLIT
+    hidden_begin = split * hidden_per_split
 
     token_offsets = token_block * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
     out_offsets = out_block * BLOCK_OUT + tl.arange(0, BLOCK_OUT)
     hidden_offsets = tl.arange(0, BLOCK_HIDDEN)
     accum = tl.zeros((BLOCK_TOKENS, BLOCK_OUT), dtype=tl.float32)
 
-    for hidden_start in range(0, hidden_size, BLOCK_HIDDEN):
+    for hidden_step in range(0, hidden_per_split, BLOCK_HIDDEN):
+        hidden_start = hidden_begin + hidden_step
         hidden = hidden_start + hidden_offsets
         a = tl.load(
             a_ptr
@@ -101,14 +119,56 @@ def _deepseek_v4_sm89_fp8_einsum_kernel(
         )
         accum += raw * a_scale[:, None] * b_scale[None, :]
 
-    tl.store(
-        out_ptr
-        + token_offsets[:, None] * out_stride_token
-        + group * out_stride_group
-        + out_offsets[None, :] * out_stride_rank,
-        accum,
-        mask=(token_offsets[:, None] < num_tokens) & (out_offsets[None, :] < out_rank),
-    )
+    mask = (token_offsets[:, None] < num_tokens) & (out_offsets[None, :] < out_rank)
+    if SPLIT == 1:
+        tl.store(
+            out_ptr
+            + token_offsets[:, None] * out_stride_token
+            + group * out_stride_group
+            + out_offsets[None, :] * out_stride_rank,
+            accum,
+            mask=mask,
+        )
+    else:
+        # partial is [SPLIT, num_tokens, num_groups, out_rank], contiguous
+        tl.store(
+            partial_ptr
+            + split * num_tokens * num_groups * out_rank
+            + token_offsets[:, None] * num_groups * out_rank
+            + group * out_rank
+            + out_offsets[None, :],
+            accum,
+            mask=mask,
+        )
+
+
+@triton.jit(do_not_specialize=["numel"])
+def _deepseek_v4_sm89_fp8_einsum_reduce_kernel(
+    partial_ptr,
+    out_ptr,
+    numel,
+    SPLIT: tl.constexpr,
+    BLOCK: tl.constexpr,
+) -> None:
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < numel
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for s in tl.static_range(SPLIT):
+        acc += tl.load(partial_ptr + s * numel + offsets, mask=mask, other=0.0)
+    tl.store(out_ptr + offsets, acc, mask=mask)
+
+
+def _choose_split(num_tiles: int, k_blocks: int) -> int:
+    """Largest power of two that divides the K blocks and keeps the grid within
+    the target CTA count; 1 when the tiles already fill the GPU."""
+    split = 1
+    while (
+        split * 2 <= k_blocks
+        and k_blocks % (split * 2) == 0
+        and num_tiles * split * 2 <= _SPLITK_TARGET_CTAS
+    ):
+        split *= 2
+    return split
 
 
 def _deepseek_v4_sm89_fp8_einsum(
@@ -117,6 +177,7 @@ def _deepseek_v4_sm89_fp8_einsum(
     b: torch.Tensor,
     b_scale: torch.Tensor,
     out: torch.Tensor,
+    split_override: int | None = None,
 ) -> None:
     num_tokens, num_groups, hidden_size = a.shape
     b_groups, out_rank, b_hidden_size = b.shape
@@ -141,10 +202,33 @@ def _deepseek_v4_sm89_fp8_einsum(
     block_tokens = 16
     block_out = 128
     block_hidden = 128
+    num_tiles = (
+        triton.cdiv(num_tokens, block_tokens)
+        * triton.cdiv(out_rank, block_out)
+        * num_groups
+    )
+    split = (
+        _choose_split(num_tiles, hidden_size // block_hidden)
+        if _SPLITK and out.is_contiguous()
+        else 1
+    )
+    if split_override is not None:
+        split = split_override
+    # the partial buffer and the reduce kernel index out as [tokens, groups, rank]
+    assert split == 1 or out.is_contiguous()
+    partial = (
+        torch.empty(
+            (split, num_tokens, num_groups, out_rank),
+            device=out.device,
+            dtype=torch.float32,
+        )
+        if split > 1
+        else out
+    )
     grid = (
         triton.cdiv(num_tokens, block_tokens),
         triton.cdiv(out_rank, block_out),
-        num_groups,
+        num_groups * split,
     )
     _deepseek_v4_sm89_fp8_einsum_kernel[grid](
         a,
@@ -152,6 +236,7 @@ def _deepseek_v4_sm89_fp8_einsum(
         b,
         b_scale,
         out,
+        partial,
         num_tokens,
         num_groups,
         out_rank,
@@ -174,9 +259,16 @@ def _deepseek_v4_sm89_fp8_einsum(
         BLOCK_TOKENS=block_tokens,
         BLOCK_OUT=block_out,
         BLOCK_HIDDEN=block_hidden,
+        SPLIT=split,
         num_warps=4,
         num_stages=3,
     )
+    if split > 1:
+        numel = num_tokens * num_groups * out_rank
+        reduce_block = 1024
+        _deepseek_v4_sm89_fp8_einsum_reduce_kernel[
+            (triton.cdiv(numel, reduce_block),)
+        ](partial, out, numel, SPLIT=split, BLOCK=reduce_block, num_warps=4)
 
 
 def _use_deepseek_v4_sm89_triton_fp8_einsum(
